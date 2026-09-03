@@ -28,20 +28,106 @@
 #include "access/transam.h"
 #include "access/xlogdefs.h"
 #include "cluster/cluster_multixact_current.h"
+#include "cluster/cluster_itl_slot.h"
 #include "cluster/cluster_sf_dep.h"
 #include "cluster/cluster_undo_format.h"
 #include "storage/block.h"
 
 #define CLUSTER_CTRC_FORMAT_VERSION UINT8_C(1)
 #define CLUSTER_CTRC_TXN_KEY_BYTES 96
-#define CLUSTER_CTRC_SEAL_REQUEST_BYTES 128
+#define CLUSTER_CTRC_SEAL_REQUEST_BYTES 136
 #define CLUSTER_CTRC_REPLY_HEADER_BYTES 64
 #define CLUSTER_CTRC_LOCAL_ACK_BYTES 416
+#define CLUSTER_CTRC_REPLY_ACK_OFFSET 64
+#define CLUSTER_CTRC_REPLY_TAIL_OFFSET 480
+#define CLUSTER_CTRC_PUBLICATION_ENCODING_BYTES 143
+#define CLUSTER_CTRC_TARGET_ENCODING_MAX_BYTES 239
+#define CLUSTER_CTRC_ROW_ENCODING_MAX_BYTES 623
 #define CLUSTER_CTRC_WIRE_MAGIC UINT32_C(0x50474354)
+#define CLUSTER_CTRC_WIRE_VERSION UINT16_C(2)
+#define CLUSTER_CTRC_SELECTOR_VERSION UINT8_C(1)
+#define CLUSTER_CTRC_FORWARD_KIND UINT8_C(11)
+#define CLUSTER_CTRC_INTERNAL_ENDPOINT ((int32)-2)
 #define CLUSTER_CTRC_MAX_PARTICIPANTS CLUSTER_SF_DEP_MAX_ORIGINS
+#define CLUSTER_CTRC_PAGE_LSN_ORIGIN_INVALID UINT16_MAX
 
 #define CTRC_ACK_FLAG_ZERO_RANGE UINT16_C(0x0001)
 #define CTRC_ACK_FLAG_ALL_DURABLE UINT16_C(0x0002)
+
+typedef enum ClusterCtrcSealSuboperation
+{
+	CTRC_SEAL_CLOSE_AND_CLEAN = 1,
+	CTRC_SEAL_CERTIFICATE_COMMITTED = 2
+} ClusterCtrcSealSuboperation;
+
+typedef enum ClusterCtrcSealReplyResult
+{
+	CTRC_SEAL_REPLY_DENIED = 0,
+	CTRC_SEAL_REPLY_LOCAL_RELEASE_ACK = 1,
+	CTRC_SEAL_REPLY_PENDING_DRAIN = 2,
+	CTRC_SEAL_REPLY_BLOCKED_RETAIN = 3,
+	CTRC_SEAL_REPLY_CERTIFICATE_RECLAIMED = 4
+} ClusterCtrcSealReplyResult;
+
+typedef enum ClusterCtrcSealReason
+{
+	CTRC_SEAL_REASON_MALFORMED = 1,
+	CTRC_SEAL_REASON_IDENTITY = 2,
+	CTRC_SEAL_REASON_PREPARED = 3,
+	CTRC_SEAL_REASON_CLEANOUT = 4,
+	CTRC_SEAL_REASON_ACK_UNAVAILABLE = 5
+} ClusterCtrcSealReason;
+
+/* One counter per frozen §14.1 semantic.  These are observability only and
+ * never participate in authority or release decisions. */
+typedef enum ClusterCtrcStatId
+{
+	CTRC_STAT_GRANT_ISSUED = 0,
+	CTRC_STAT_GRANT_REFUSED,
+	CTRC_STAT_RECEIPT_PREPARED,
+	CTRC_STAT_RECEIPT_APPLIED,
+	CTRC_STAT_RECEIPT_CANCELLED,
+	CTRC_STAT_RECEIPT_CAPACITY_REFUSED,
+	CTRC_STAT_SEAL_STARTED,
+	CTRC_STAT_SEAL_BLOCKED,
+	CTRC_STAT_TARGET_ABSENT,
+	CTRC_STAT_TARGET_REWRITTEN,
+	CTRC_STAT_TARGET_RETAINED,
+	CTRC_STAT_ACK_FROZEN,
+	CTRC_STAT_ACK_RESENT,
+	CTRC_STAT_CERTIFICATE_APPLIED,
+	CTRC_STAT_CERTIFICATE_REPLAYED,
+	CTRC_STAT_L11_RELEASE_SAMPLE,
+	CTRC_STAT_L12_RECYCLE,
+	CTRC_STAT_ORDINARY_PUBLICATION_AFTER_APPLY,
+	CTRC_STAT_CURRENT_MX_PUBLICATION_AFTER_APPLY,
+	CTRC_STAT_PUBLICATION_ORDER_VIOLATION,
+	CTRC_STAT_COUNT
+} ClusterCtrcStatId;
+
+typedef enum ClusterCtrcCleanerReason
+{
+	CTRC_CLEANER_REASON_NONE = 0,
+	CTRC_CLEANER_REASON_PREPARED_DRAIN,
+	CTRC_CLEANER_REASON_RESOURCE_X,
+	CTRC_CLEANER_REASON_PAGE_REVALIDATE,
+	CTRC_CLEANER_REASON_WAL_DURABILITY,
+	CTRC_CLEANER_REASON_PARTICIPANT_ACK,
+	CTRC_CLEANER_REASON_BLOCK0_CERTIFICATE,
+	CTRC_CLEANER_REASON_BLOCKED,
+	CTRC_CLEANER_REASON_COUNT
+} ClusterCtrcCleanerReason;
+
+/* A single shared scheduling seam.  The phase value selects a safe point;
+ * the seam never changes proof, receipt, ACK, certificate or verdict bytes. */
+typedef enum ClusterCtrcTestBarrierPhase
+{
+	CTRC_TEST_BARRIER_NONE = 0,
+	CTRC_TEST_BARRIER_ACTIVE_PROOF_READY = 1,
+	CTRC_TEST_BARRIER_ACK_DURABLE = 2,
+	CTRC_TEST_BARRIER_CERTIFICATE_READY = 3,
+	CTRC_TEST_BARRIER_COUNT
+} ClusterCtrcTestBarrierPhase;
 
 typedef enum ClusterCtrcReferenceKind
 {
@@ -77,8 +163,21 @@ typedef enum ClusterCtrcReceiptState
 	CTRC_RECEIPT_CLEANED,
 	CTRC_RECEIPT_CANCELLED,
 	CTRC_RECEIPT_ACK_FROZEN,
-	CTRC_RECEIPT_BLOCKED
+	CTRC_RECEIPT_BLOCKED,
+	/* Transient, shared-memory-only ownership of an APPLIED ordinary ITL
+	 * receipt while its exact target is replaced.  It is never a positive
+	 * release state and keeps the existing applied_count outstanding. */
+	CTRC_RECEIPT_RETARGETING
 } ClusterCtrcReceiptState;
+
+/* Parallel open-addressing metadata for the bounded receipt array.  This is
+ * volatile shared-memory state, not wire, WAL, or persistent ABI. */
+typedef enum ClusterCtrcReceiptProbeState
+{
+	CTRC_RECEIPT_PROBE_EMPTY = 0,
+	CTRC_RECEIPT_PROBE_OCCUPIED,
+	CTRC_RECEIPT_PROBE_TOMBSTONE
+} ClusterCtrcReceiptProbeState;
 
 typedef enum ClusterCtrcReleaseDisposition
 {
@@ -164,6 +263,8 @@ typedef struct ClusterCtrcTargetV1
 	uint32 rel_number;
 	int32 fork_number;
 	BlockNumber block_number;
+	uint16 predecessor_page_lsn_origin_node_id;
+	uint16 predecessor_page_lsn_reserved16;
 	uint64 predecessor_page_lsn;
 	uint64 predecessor_page_scn;
 	uint64 publication_own_generation;
@@ -190,6 +291,18 @@ typedef struct ClusterCtrcTargetV1
 	uint64 intended_descriptor_hash;
 } ClusterCtrcTargetV1;
 
+typedef enum ClusterCtrcPageVersionOrder
+{
+	CTRC_PAGE_VERSION_CURRENT = 0,
+	CTRC_PAGE_VERSION_REGRESSED,
+	CTRC_PAGE_VERSION_UNKNOWN
+} ClusterCtrcPageVersionOrder;
+
+extern ClusterCtrcPageVersionOrder cluster_ctrc_page_version_order(
+	uint16 predecessor_origin, XLogRecPtr predecessor_lsn,
+	SCN predecessor_scn, uint16 current_origin, XLogRecPtr current_lsn,
+	SCN current_scn);
+
 typedef struct ClusterCtrcParticipantIdentity
 {
 	uint16 node_id;
@@ -200,6 +313,21 @@ typedef struct ClusterCtrcParticipantIdentity
 	uint64 admission_record_generation;
 } ClusterCtrcParticipantIdentity;
 
+/* Stack-only close work item owned by the existing undo cleaner.  It is not
+ * shared-memory or wire ABI; the 136-byte encoder remains the sole wire
+ * representation. */
+typedef struct ClusterCtrcCloseDispatch
+{
+	ClusterCtrcTxnKeyV1 key;
+	ClusterCtrcParticipantIdentity participant;
+	uint64 request_id;
+	uint64 seal_generation;
+	uint32 grant_generation;
+	uint8 suboperation;
+	uint8 reserved8[3];
+	uint32 reserved32;
+} ClusterCtrcCloseDispatch;
+
 typedef struct ClusterCtrcOriginEntry
 {
 	ClusterCtrcTxnKeyV1 key;
@@ -207,10 +335,14 @@ typedef struct ClusterCtrcOriginEntry
 	uint32 grant_generation;
 	uint32 touched_bitmap;
 	uint64 seal_generation;
+	uint32 close_dispatched_bitmap;
+	uint32 close_confirmed_bitmap;
+	uint32 ack_bitmap;
 	uint8 state;
 	uint8 touched_count;
 	uint8 reserved8[6];
 	ClusterCtrcParticipantIdentity touched[CLUSTER_CTRC_MAX_PARTICIPANTS];
+	uint64 close_request_id[CLUSTER_CTRC_MAX_PARTICIPANTS];
 } ClusterCtrcOriginEntry;
 
 typedef enum ClusterCtrcOriginReservationKind
@@ -370,6 +502,8 @@ typedef struct ClusterCtrcSealRequestV1
 	uint64 root_id;
 	uint64 root_generation;
 	uint64 seal_generation;
+	uint32 participant_capability_record_generation;
+	uint32 reserved_tail;
 } ClusterCtrcSealRequestV1;
 
 typedef struct ClusterCtrcSealReplyHeaderV1
@@ -403,7 +537,8 @@ typedef enum ClusterCtrcOriginReserveResult
 {
 	CLUSTER_CTRC_ORIGIN_RESERVE_REFUSED = 0,
 	CLUSTER_CTRC_ORIGIN_RESERVED_PENDING = 1,
-	CLUSTER_CTRC_ORIGIN_RESERVED_EXISTING_OPEN = 2
+	CLUSTER_CTRC_ORIGIN_RESERVED_EXISTING_OPEN = 2,
+	CLUSTER_CTRC_ORIGIN_RESERVE_RETRY_RELEASED = 3
 } ClusterCtrcOriginReserveResult;
 
 typedef enum ClusterCtrcTouchResult
@@ -450,6 +585,13 @@ typedef enum ClusterCtrcDischargeResult
 	CLUSTER_CTRC_DISCHARGE_CLEANED = 1
 } ClusterCtrcDischargeResult;
 
+typedef enum ClusterCtrcItlCleanoutApplyResult
+{
+	CLUSTER_CTRC_ITL_CLEANOUT_RETAIN = 0,
+	CLUSTER_CTRC_ITL_CLEANOUT_ALREADY_TERMINAL = 1,
+	CLUSTER_CTRC_ITL_CLEANOUT_REWRITTEN = 2
+} ClusterCtrcItlCleanoutApplyResult;
+
 typedef enum ClusterCtrcCloseResult
 {
 	CLUSTER_CTRC_CLOSE_BLOCKED_RETAIN = 0,
@@ -490,6 +632,26 @@ typedef enum ClusterCtrcCleanResult
 	CTRC_CLEANED_SUCCESSOR_REPLACED = 3
 } ClusterCtrcCleanResult;
 
+typedef enum ClusterCtrcCurrentMxRewriteKind
+{
+	CTRC_CURRENT_MX_REWRITE_RETAIN = 0,
+	CTRC_CURRENT_MX_REWRITE_INVALIDATE,
+	CTRC_CURRENT_MX_REWRITE_COMMITTED_UPDATER,
+	CTRC_CURRENT_MX_REWRITE_SUCCESSOR
+} ClusterCtrcCurrentMxRewriteKind;
+
+/* Pure descriptor-level plan.  It contains no shared-memory pointer and is
+ * produced before allocating a successor descriptor or touching a page. */
+typedef struct ClusterCtrcCurrentMxRewritePlan
+{
+	uint8 kind;
+	uint8 clean_result;
+	uint16 survivor_count;
+	TransactionId committed_updater_xid;
+	SCN committed_updater_scn;
+	MultiXactMember survivors[CLUSTER_CURRENT_MX_MAX_MEMBERS];
+} ClusterCtrcCurrentMxRewritePlan;
+
 typedef struct ClusterCtrcTransferState
 {
 	uint16 active_survivor_count;
@@ -523,6 +685,17 @@ typedef struct ClusterCtrcCertificateInput
 	bool block0_terminal_exact;
 	bool all_dependencies_durable;
 } ClusterCtrcCertificateInput;
+
+/* Stack-only immutable copy used across the no-CTRC-lock block-0 certificate
+ * phase.  It is neither shared-memory nor wire ABI. */
+typedef struct ClusterCtrcOriginCertificateSnapshot
+{
+	uint64 origin_index;
+	ClusterCtrcOriginEntry origin;
+	ClusterCtrcLocalReleaseAckV1 acks[CLUSTER_CTRC_MAX_PARTICIPANTS];
+	uint16 ack_count;
+	uint8 reserved[6];
+} ClusterCtrcOriginCertificateSnapshot;
 
 typedef enum ClusterCtrcCertificateResult
 {
@@ -571,9 +744,33 @@ typedef struct ClusterCtrcCapacity
 	uint64 origin_key_entries;
 	uint64 participant_key_entries;
 	uint64 receipt_entries;
-	uint64 ack_summary_entries;
+	uint64 participant_ack_summary_entries;
+	uint64 origin_ack_inbox_entries;
 	Size total_bytes;
 } ClusterCtrcCapacity;
+
+typedef struct ClusterCtrcDebugSnapshot
+{
+	uint64 origin_open;
+	uint64 origin_sealing;
+	uint64 origin_release_proven;
+	uint64 origin_blocked;
+	uint64 participant_open;
+	uint64 participant_draining;
+	uint64 participant_ack_ready;
+	uint64 participant_ack_frozen;
+	uint64 participant_blocked;
+	uint64 receipt_prepared;
+	uint64 receipt_applied;
+	uint64 receipt_cleaned;
+	uint64 receipt_cancelled;
+	uint64 receipt_ack_frozen;
+	uint64 receipt_blocked;
+	uint64 full_refusal_count;
+	uint64 test_barrier_hit_count;
+	uint32 test_barrier_phase;
+	uint32 cleaner_reason;
+} ClusterCtrcDebugSnapshot;
 
 typedef enum ClusterCtrcCapacityDisposition
 {
@@ -583,7 +780,7 @@ typedef enum ClusterCtrcCapacityDisposition
 StaticAssertDecl(sizeof(ClusterCtrcTxnKeyV1) == CLUSTER_CTRC_TXN_KEY_BYTES,
 				 "CTRC transaction key must remain exactly 96 bytes");
 StaticAssertDecl(sizeof(ClusterCtrcSealRequestV1) == CLUSTER_CTRC_SEAL_REQUEST_BYTES,
-				 "CTRC seal request must remain exactly 128 bytes");
+				 "CTRC seal request must remain exactly 136 bytes");
 StaticAssertDecl(sizeof(ClusterCtrcSealReplyHeaderV1) == CLUSTER_CTRC_REPLY_HEADER_BYTES,
 				 "CTRC reply header must remain exactly 64 bytes");
 StaticAssertDecl(sizeof(ClusterCtrcLocalReleaseAckV1) == CLUSTER_CTRC_LOCAL_ACK_BYTES,
@@ -596,19 +793,73 @@ StaticAssertDecl(offsetof(ClusterCtrcLocalReleaseAckV1, crc32c) == 412,
 extern const uint8 cluster_ctrc_empty_sha256[32];
 extern bool cluster_ctrc_sha256_exact(const void *bytes, Size length,
 	uint8 digest[32]);
+extern bool cluster_ctrc_seal_request_encode(
+	const ClusterCtrcTxnKeyV1 *key, uint64 request_id,
+	uint32 grant_generation, uint64 seal_generation,
+	uint32 participant_capability_record_generation,
+	ClusterCtrcSealSuboperation suboperation,
+	uint8 *bytes, Size length);
+extern bool cluster_ctrc_seal_request_decode(
+	const uint8 *bytes, Size length, uint64 authenticated_system_identifier,
+	int32 envelope_source_node, int32 local_node, uint64 current_epoch,
+	ClusterCtrcSealRequestV1 *request_out, ClusterCtrcTxnKeyV1 *key_out);
+extern bool cluster_ctrc_local_release_ack_encode(
+	const ClusterCtrcLocalReleaseAckV1 *ack,
+	uint8 bytes[CLUSTER_CTRC_LOCAL_ACK_BYTES]);
+extern bool cluster_ctrc_local_release_ack_decode(
+	const uint8 bytes[CLUSTER_CTRC_LOCAL_ACK_BYTES],
+	ClusterCtrcLocalReleaseAckV1 *ack_out);
+extern bool cluster_ctrc_seal_reply_encode(
+	const uint8 *request_bytes, Size request_length,
+	int32 source_node, int32 destination_node,
+	ClusterCtrcSealReplyResult result, uint16 first_reason,
+	const ClusterCtrcLocalReleaseAckV1 *ack,
+	uint8 *page, Size page_length);
+extern bool cluster_ctrc_seal_reply_decode(
+	const uint8 *page, Size page_length,
+	const uint8 *request_bytes, Size request_length,
+	int32 expected_source_node, int32 expected_destination_node,
+	ClusterCtrcSealReplyHeaderV1 *header_out,
+	ClusterCtrcLocalReleaseAckV1 *ack_out);
 
 extern bool cluster_ctrc_capacity_compute(Size n_buffers, int max_backends,
 										  int declared_nodes,
 										  ClusterCtrcCapacity *capacity);
+extern bool cluster_ctrc_participant_index_compute(
+	uint64 origin_index, uint64 origin_entries, uint64 participant_entries,
+	uint16 participant_node_id, uint64 *index_out);
 extern ClusterCtrcCapacityDisposition cluster_ctrc_runtime_full_disposition(void);
 extern Size cluster_ctrc_shmem_size(void);
 extern void cluster_ctrc_shmem_init(void);
 extern void cluster_ctrc_shmem_register(void);
 extern bool cluster_ctrc_shmem_ready(void);
+extern const char *cluster_ctrc_stat_name(ClusterCtrcStatId stat);
+extern uint64 cluster_ctrc_stat_get(ClusterCtrcStatId stat);
+extern void cluster_ctrc_stat_bump(ClusterCtrcStatId stat);
+extern const char *cluster_ctrc_cleaner_reason_name(
+	ClusterCtrcCleanerReason reason);
+extern ClusterCtrcCleanerReason cluster_ctrc_cleaner_reason_get(void);
+extern void cluster_ctrc_cleaner_reason_set(ClusterCtrcCleanerReason reason);
+extern bool cluster_ctrc_debug_snapshot(ClusterCtrcDebugSnapshot *snapshot);
+extern bool cluster_ctrc_test_barrier_control(
+	ClusterCtrcTestBarrierPhase phase, bool armed);
+extern void cluster_ctrc_test_barrier_wait(ClusterCtrcTestBarrierPhase phase);
+extern void cluster_ctrc_note_publication_after_apply(
+	const ClusterCtrcReceiptHandle *handle, bool current_mx);
+extern bool cluster_ctrc_origin_grant_publishable_entry(
+	const ClusterCtrcOriginEntry *origin, const ClusterCtrcTxnKeyV1 *key,
+	const ClusterCtrcParticipantIdentity *participant,
+	uint32 grant_generation);
+extern bool cluster_ctrc_origin_grant_publishable(
+	const ClusterCtrcTxnKeyV1 *key,
+	const ClusterCtrcParticipantIdentity *participant,
+	uint32 grant_generation);
 
 extern ClusterCtrcOriginReserveResult cluster_ctrc_origin_reserve_active(
 	const ClusterCtrcTxnKeyV1 *key,
 	ClusterCtrcOriginReservation *reservation);
+extern bool cluster_ctrc_origin_release_overlap_pending(
+	const ClusterCtrcTxnKeyV1 *key);
 extern ClusterCtrcOriginReserveResult cluster_ctrc_origin_reserve_entry(
 	ClusterCtrcOriginEntry *origin, const ClusterCtrcTxnKeyV1 *key,
 	uint64 origin_index, uint64 reservation_generation,
@@ -641,6 +892,57 @@ extern ClusterCtrcTouchResult cluster_ctrc_origin_record_touched(
 extern bool cluster_ctrc_origin_has_exact_touch(
 	const ClusterCtrcOriginEntry *origin,
 	const ClusterCtrcParticipantIdentity *participant);
+extern bool cluster_ctrc_origin_begin_seal_entry(
+	ClusterCtrcOriginEntry *origin, uint64 seal_generation);
+extern bool cluster_ctrc_origin_arm_close_entry(
+	ClusterCtrcOriginEntry *origin, uint16 participant_node_id,
+	uint64 request_id);
+extern bool cluster_ctrc_origin_note_close_reply_entry(
+	ClusterCtrcOriginEntry *origin, uint16 participant_node_id,
+	uint64 request_id, ClusterCtrcSealReplyResult result);
+extern bool cluster_ctrc_origin_arm_certificate_entry(
+	ClusterCtrcOriginEntry *origin, uint16 participant_node_id,
+	uint64 request_id);
+extern bool cluster_ctrc_origin_note_certificate_reply_entry(
+	ClusterCtrcOriginEntry *origin, uint16 participant_node_id,
+	uint64 request_id, ClusterCtrcSealReplyResult result);
+extern bool cluster_ctrc_origin_begin_cleaning_entry(
+	ClusterCtrcOriginEntry *origin);
+extern bool cluster_ctrc_origin_request_snapshot_shared(
+	uint64 request_id, uint16 participant_node_id,
+	ClusterCtrcTxnKeyV1 *key_out,
+	ClusterCtrcParticipantIdentity *identity_out,
+	uint32 *grant_generation_out, uint64 *seal_generation_out,
+	ClusterCtrcSealSuboperation *suboperation_out);
+extern bool cluster_ctrc_origin_close_request_snapshot_shared(
+	uint64 request_id, uint16 participant_node_id,
+	ClusterCtrcTxnKeyV1 *key_out,
+	ClusterCtrcParticipantIdentity *identity_out,
+	uint32 *grant_generation_out, uint64 *seal_generation_out);
+extern bool cluster_ctrc_origin_note_close_reply_shared(
+	uint64 request_id, uint16 participant_node_id,
+	ClusterCtrcSealReplyResult result);
+extern bool cluster_ctrc_origin_note_certificate_reply_shared(
+	uint64 request_id, uint16 participant_node_id,
+	ClusterCtrcSealReplyResult result);
+extern bool cluster_ctrc_origin_next_open_shared(ClusterCtrcTxnKeyV1 *key_out);
+extern bool cluster_ctrc_origin_begin_seal_shared(
+	const ClusterCtrcTxnKeyV1 *key);
+extern bool cluster_ctrc_origin_next_close_dispatch_shared(
+	ClusterCtrcCloseDispatch *dispatch_out);
+extern bool cluster_ctrc_cleaner_run_pass(void);
+
+/*
+ * L11/L12 canonical release sampler for the current allocator GC.  The
+ * caller holds no allocator/page/CTRC lock.  Success means one exact local
+ * terminal slot was sampled under admitted block-0 current authority with
+ * the durable CTRC release bit set, a stable native terminal bracket and the
+ * supplied horizon-fold epoch still current.  It never mutates block 0.
+ */
+extern bool cluster_ctrc_terminal_release_sample_exact(
+	uint32 segment_id, uint16 slot_offset, TransactionId xid,
+	uint16 slot_wrap, uint8 terminal_status, SCN terminal_scn,
+	uint64 expected_epoch);
 extern ClusterCtrcParticipantOpenResult cluster_ctrc_participant_open(
 	ClusterCtrcParticipantEntry *participant, const ClusterCtrcTxnKeyV1 *key,
 	uint32 grant_generation,
@@ -657,8 +959,13 @@ extern ClusterCtrcPrepareResult cluster_ctrc_receipt_prepare_table_locked(
 	uint32 grant_generation,
 	const ClusterCtrcPublicationIdV1 *publication,
 	const ClusterCtrcTargetV1 *target,
-	ClusterCtrcReceipt *receipts, Size receipt_count,
-	uint64 journal_sequence, uint64 *receipt_index_out);
+	ClusterCtrcReceipt *receipts, uint8 *probe_states, Size receipt_count,
+	uint64 journal_sequence, uint64 *receipt_index_out,
+	Size *probe_count_out);
+extern bool cluster_ctrc_receipt_reclaim_frozen_table_locked(
+	const ClusterCtrcTxnKeyV1 *key, uint64 expected_receipt_count,
+	ClusterCtrcReceipt *receipts, uint8 *probe_states, Size receipt_count,
+	Size *reclaimed_count_out);
 extern ClusterCtrcPrepareResult cluster_ctrc_receipt_prepare_shared(
 	const ClusterCtrcTxnKeyV1 *key,
 	const ClusterCtrcParticipantIdentity *identity,
@@ -672,6 +979,19 @@ extern ClusterCtrcApplyResult cluster_ctrc_receipt_apply_prepared(
 extern ClusterCtrcApplyResult cluster_ctrc_receipt_apply_shared(
 	const ClusterCtrcReceiptHandle *handle,
 	const ClusterCtrcTargetV1 *final_target, ClusterCtrcApplyToken *token);
+extern ClusterCtrcApplyResult cluster_ctrc_receipt_retarget_itl(
+	ClusterCtrcParticipantEntry *participant, ClusterCtrcReceipt *receipt,
+	const ClusterCtrcTargetV1 *pending_target,
+	const ClusterCtrcTargetV1 *final_target, ClusterCtrcApplyToken *token);
+extern ClusterCtrcApplyResult cluster_ctrc_receipt_retarget_itl_shared(
+	const ClusterCtrcReceiptHandle *handle,
+	const ClusterCtrcTargetV1 *pending_target,
+	const ClusterCtrcTargetV1 *final_target, ClusterCtrcApplyToken *token);
+extern bool cluster_ctrc_receipt_itl_reuse_candidate_shared(
+	const ClusterCtrcReceiptHandle *handle,
+	const ClusterCtrcTargetV1 *pending_target,
+	const ClusterCtrcItlTargetIdentity *current_target,
+	const uint8 current_slot_sha256[32]);
 extern bool cluster_ctrc_receipt_cancel_prepared(
 	ClusterCtrcParticipantEntry *participant, ClusterCtrcReceipt *receipt);
 extern bool cluster_ctrc_receipt_cancel_shared(
@@ -688,14 +1008,71 @@ extern ClusterCtrcDischargeResult cluster_ctrc_receipt_discharge_itl_shared(
 	const ClusterCtrcItlTargetIdentity *expected_target,
 	ClusterCtrcItlProjection projection,
 	const ClusterCtrcDurability *durability);
+extern ClusterCtrcDischargeResult cluster_ctrc_receipt_discharge_current_mx(
+	ClusterCtrcParticipantEntry *participant, ClusterCtrcReceipt *receipt,
+	const ClusterCtrcTargetV1 *expected_target,
+	ClusterCtrcCleanResult clean_result,
+	const ClusterCtrcDurability *durability);
+extern ClusterCtrcDischargeResult
+cluster_ctrc_receipt_discharge_current_mx_shared(
+	const ClusterCtrcReceiptHandle *handle,
+	const ClusterCtrcTargetV1 *expected_target,
+	ClusterCtrcCleanResult clean_result,
+	const ClusterCtrcDurability *durability);
+extern ClusterCtrcItlCleanoutApplyResult cluster_ctrc_itl_cleanout_slot(
+	const ClusterCtrcTxnKeyV1 *key, const ClusterCtrcTargetV1 *target,
+	ClusterCtrcTerminalStatus terminal_status, SCN commit_scn,
+	ClusterItlSlotData *slot);
 extern ClusterCtrcCloseResult cluster_ctrc_participant_close(
 	ClusterCtrcParticipantEntry *participant,
 	const ClusterCtrcParticipantIdentity *identity, uint32 grant_generation,
 	uint64 seal_generation);
+extern ClusterCtrcCloseResult cluster_ctrc_participant_close_or_tombstone(
+	ClusterCtrcParticipantEntry *participant, const ClusterCtrcTxnKeyV1 *key,
+	const ClusterCtrcParticipantIdentity *identity, uint32 grant_generation,
+	uint64 seal_generation);
+extern ClusterCtrcSealReplyResult cluster_ctrc_participant_request_apply(
+	ClusterCtrcParticipantEntry *participant,
+	ClusterCtrcLocalReleaseAckV1 *ack_summary,
+	const ClusterCtrcTxnKeyV1 *key,
+	const ClusterCtrcParticipantIdentity *identity, uint32 grant_generation,
+	uint64 seal_generation, ClusterCtrcSealSuboperation suboperation,
+	uint16 *first_reason, ClusterCtrcLocalReleaseAckV1 *ack_out);
+extern ClusterCtrcSealReplyResult cluster_ctrc_participant_request_shared(
+	const ClusterCtrcTxnKeyV1 *key,
+	const ClusterCtrcParticipantIdentity *identity, uint32 grant_generation,
+	uint64 seal_generation, ClusterCtrcSealSuboperation suboperation,
+	uint16 *first_reason, ClusterCtrcLocalReleaseAckV1 *ack_out);
+extern bool cluster_ctrc_origin_ack_land_entry(
+	ClusterCtrcOriginEntry *origin, uint64 request_id,
+	const ClusterCtrcLocalReleaseAckV1 *ack,
+	ClusterCtrcLocalReleaseAckV1 *ack_slot);
+extern bool cluster_ctrc_origin_ack_land_shared(
+	uint64 request_id, const ClusterCtrcLocalReleaseAckV1 *ack);
 extern ClusterCtrcLossResult cluster_ctrc_participant_note_owner_loss(
 	ClusterCtrcParticipantEntry *participant, ClusterCtrcReceipt *receipt);
 extern ClusterCtrcCleanResult cluster_ctrc_clean_reference(
 	const ClusterCtrcCleanReferenceInput *input);
+extern bool cluster_ctrc_current_mx_terminal_proof_exact(
+	const ClusterCtrcTxnKeyV1 *key,
+	const ClusterCurrentMxKey *descriptor_key,
+	const ClusterCtrcPublicationIdV1 *publication,
+	const ClusterCurrentMxMemberDesc *members,
+	const ClusterCurrentMemberProof *proofs, uint16 nmembers,
+	ClusterCtrcTerminalStatus *terminal_status_out, SCN *commit_scn_out);
+extern bool cluster_ctrc_current_mx_rewrite_plan(
+	const ClusterCtrcTxnKeyV1 *key,
+	const ClusterCtrcPublicationIdV1 *publication,
+	const ClusterCurrentMxMemberDesc *members,
+	const ClusterCurrentMemberProof *proofs, uint16 nmembers,
+	ClusterCtrcCurrentMxRewritePlan *plan);
+extern bool cluster_ctrc_native_current_mx_mutation_allowed(
+	bool peer_mode, int mx_origin_slot);
+extern bool cluster_ctrc_relation_removal_ready_from_snapshot(
+	const ClusterCtrcReceipt *receipts, Size receipt_count,
+	uint32 spc_oid, uint32 db_oid, uint32 rel_number);
+extern bool cluster_ctrc_relation_removal_ready_shared(
+	uint32 spc_oid, uint32 db_oid, uint32 rel_number);
 extern ClusterCtrcTransferResult cluster_ctrc_transfer_note_successor_receipt(
 	ClusterCtrcTransferState *transfer);
 extern ClusterCtrcTransferResult cluster_ctrc_transfer_note_descriptor_durable(
@@ -706,8 +1083,22 @@ extern ClusterCtrcAckResult cluster_ctrc_participant_build_ack(
 	ClusterCtrcParticipantEntry *participant,
 	const ClusterCtrcDurability *durability,
 	ClusterCtrcLocalReleaseAckV1 *ack);
+extern ClusterCtrcAckResult cluster_ctrc_participant_ack_from_snapshot(
+	const ClusterCtrcParticipantEntry *participant,
+	ClusterCtrcReceipt *receipts, Size receipt_count,
+	const ClusterCtrcDurability *durability,
+	ClusterCtrcLocalReleaseAckV1 *ack);
 extern ClusterCtrcCertificateResult cluster_ctrc_origin_certificate_validate(
 	const ClusterCtrcCertificateInput *input);
+extern bool cluster_ctrc_origin_certificate_digest(
+	const ClusterCtrcCertificateInput *input, uint8 digest[32]);
+extern bool cluster_ctrc_origin_certificate_snapshot_entry(
+	const ClusterCtrcOriginEntry *origin,
+	const ClusterCtrcLocalReleaseAckV1 ack_slots[CLUSTER_CTRC_MAX_PARTICIPANTS],
+	uint64 origin_index, ClusterCtrcOriginCertificateSnapshot *snapshot);
+extern bool cluster_ctrc_origin_certificate_commit_entry(
+	ClusterCtrcOriginEntry *origin,
+	const ClusterCtrcOriginCertificateSnapshot *snapshot);
 extern bool cluster_ctrc_terminal_recyclable(
 	const ClusterCtrcRecycleInput *input);
 extern ClusterCtrcCrashDisposition cluster_ctrc_crash_cut_disposition(

@@ -111,6 +111,16 @@
 #include "utils/rel.h"				/* RelationGetSmgr */
 
 static inline bool
+cluster_heap_itl_relation_route(bool storage_mode, bool uses_local_buffers,
+								bool shared_catalog,
+								RelFileNumber rel_number)
+{
+	return storage_mode && !uses_local_buffers
+		&& cluster_pcm_x_relation_number_tracked(
+			rel_number, shared_catalog);
+}
+
+static inline bool
 cluster_itl_write_path_enabled(Relation relation)
 {
 	/*
@@ -134,26 +144,15 @@ cluster_itl_write_path_enabled(Relation relation)
 	 * consistent on-page/TT/undo metadata and own-instance CR is well-defined.
 	 * Gate on cluster_storage_mode_enabled (cluster.enabled + valid node_id),
 	 * NOT cluster_conf_has_peers().  Local (temp) buffers stay PG-native.
+	 *
+	 * Stage 8 adjustment 6: the relation-class gate must also match the shared
+	 * SMGR/PCM boundary.  With shared_catalog disabled, catalog/system pages
+	 * are per-node md.c pages and have no Resource-X generation; producing ITL
+	 * or CTRC metadata for them would manufacture authority from PCM N/gen=0.
 	 */
-	return cluster_storage_mode_enabled() && !RelationUsesLocalBuffers(relation);
-}
-
-static const ClusterCtrcReceiptHandle *
-cluster_heap_ctrc_applied_handle(
-	const ClusterUndoRecordPrepareReceipt *receipt, uint8 target_ordinal)
-{
-	uint8 target_bit;
-
-	if (receipt == NULL
-		|| target_ordinal >= CLUSTER_UNDO_RECORD_CTRC_TARGETS)
-		return NULL;
-	target_bit = UINT8_C(1) << target_ordinal;
-	return (receipt->ctrc_pending_mask & target_bit) != 0
-		&& (receipt->ctrc_prepared_mask & target_bit) != 0
-		&& (receipt->ctrc_applied_mask & target_bit) != 0
-		&& receipt->ctrc_handles[target_ordinal].valid
-		? &receipt->ctrc_handles[target_ordinal]
-		: NULL;
+	return cluster_heap_itl_relation_route(
+		cluster_storage_mode_enabled(), RelationUsesLocalBuffers(relation),
+		cluster_shared_catalog, relation->rd_locator.relNumber);
 }
 
 typedef struct ClusterHeapItlTerminalCensus
@@ -176,8 +175,9 @@ typedef struct ClusterHeapItlTerminalCensus
  * not change the heap page geometry, its Resource-X/PCM ownership episode,
  * or the target tuple.  ITL terminal stamps are intentionally outside the
  * tuple fingerprint.  Their MarkBufferDirtyHint may emit a hint FPI and
- * advance the page LSN, so LSN is not DML authority here; every field that
- * can authorize the current DML remains exact. */
+ * advance the page LSN together with its node-origin qualifier, so neither
+ * is DML authority here; every field that can authorize the current DML
+ * remains exact. */
 typedef struct ClusterHeapDmlAuthorityGuard
 {
 	bool valid;
@@ -197,6 +197,30 @@ typedef struct ClusterHeapDmlAuthorityGuard
 	uint8 tuple_header[SizeofHeapTupleHeader];
 	ClusterItlSlotData itl_slot;
 } ClusterHeapDmlAuthorityGuard;
+
+static uint16
+cluster_heap_dml_authority_page_flags(Page page)
+{
+	return ((PageHeader) page)->pd_flags
+		& (uint16) ~(PD_LSN_ORIGIN_VALID | PD_LSN_ORIGIN_MASK);
+}
+
+/* Match the authoritative PCM identity tuple used by bufmgr rechecks.  The
+ * writer-activation token is a diagnostic projection of the current content
+ * lock bracket and legitimately rotates across unlock/relock. */
+static bool
+cluster_heap_pcm_authority_equal(const ClusterPcmOwnSnapshot *left,
+								 const ClusterPcmOwnSnapshot *right)
+{
+	return left != NULL && right != NULL
+		&& BufferTagsEqual(&left->tag, &right->tag)
+		&& left->generation == right->generation
+		&& left->reservation_token == right->reservation_token
+		&& left->resource_x_activation_generation
+			   == right->resource_x_activation_generation
+		&& left->flags == right->flags
+		&& left->pcm_state == right->pcm_state;
+}
 
 StaticAssertDecl(CLUSTER_ITL_INITRANS_DEFAULT == 8,
 				 "terminal census mask requires exactly eight ITL slots");
@@ -276,6 +300,47 @@ cluster_heap_itl_begin_terminal_census(
 	return true;
 }
 
+#ifdef USE_CLUSTER_UNIT
+typedef struct ClusterHeapPrepareRetryTestState
+{
+	bool active;
+	bool deadline_stable;
+	uint8 result_count;
+	uint8 prepare_calls;
+	uint64 expected_deadline_us;
+	const ClusterUndoRecordPrepareResult *results;
+	ClusterUndoRecordPrepareResult terminal_result;
+} ClusterHeapPrepareRetryTestState;
+
+static ClusterHeapPrepareRetryTestState cluster_heap_prepare_retry_test_state;
+
+static ClusterUndoRecordPrepareResult
+cluster_heap_prepare_undo_record_call(
+	uint8 record_type pg_attribute_unused(),
+	uint16 payload_capacity pg_attribute_unused(),
+	uint16 tt_slot_segment_id pg_attribute_unused(),
+	uint16 tt_slot_offset pg_attribute_unused(), UBA prev_uba pg_attribute_unused(),
+	uint64 absolute_deadline_us,
+	ClusterUndoRecordPrepareReceipt *receipt pg_attribute_unused())
+{
+	ClusterHeapPrepareRetryTestState *state
+		= &cluster_heap_prepare_retry_test_state;
+	ClusterUndoRecordPrepareResult result;
+
+	Assert(state->active);
+	state->prepare_calls++;
+	if (absolute_deadline_us != state->expected_deadline_us)
+		state->deadline_stable = false;
+	result = state->prepare_calls <= state->result_count
+		? state->results[state->prepare_calls - 1]
+		: CLUSTER_UNDO_RECORD_PREPARE_REFUSED;
+	state->terminal_result = result;
+	return result;
+}
+#else
+#define cluster_heap_prepare_undo_record_call cluster_undo_record_prepare
+#endif
+
 static bool
 cluster_heap_prepare_undo_record_exact(uint8 record_type,
 								   uint16 payload_capacity,
@@ -289,7 +354,7 @@ cluster_heap_prepare_undo_record_exact(uint8 record_type,
 	{
 		ClusterUndoRecordPrepareResult result;
 
-		result = cluster_undo_record_prepare(record_type, payload_capacity,
+		result = cluster_heap_prepare_undo_record_call(record_type, payload_capacity,
 			tt_slot_segment_id, tt_slot_offset, prev_uba,
 			absolute_deadline_us, receipt);
 		if (result == CLUSTER_UNDO_RECORD_PREPARE_READY)
@@ -325,7 +390,16 @@ typedef struct ClusterHeapPreparedUndoTargetPlan
 	UBA planned_uba;
 	ClusterHeapDmlAuthorityGuard guard;
 	ClusterCtrcTargetV1 final_target;
+	/* APPLY ownership survives reservation consume, which intentionally
+	 * clears ClusterUndoRecordPrepareReceipt before page publication. */
+	ClusterCtrcReceiptHandle applied_handle;
 } ClusterHeapPreparedUndoTargetPlan;
+
+static const ClusterCtrcReceiptHandle *
+cluster_heap_ctrc_retained_handle(const ClusterCtrcReceiptHandle *handle)
+{
+	return handle != NULL && handle->valid ? handle : NULL;
+}
 
 typedef struct ClusterCurrentMxStampPlan
 {
@@ -401,7 +475,7 @@ cluster_heap_dml_authority_guard_capture(
 	guard->page_lower = ((PageHeader) page)->pd_lower;
 	guard->page_upper = ((PageHeader) page)->pd_upper;
 	guard->page_special = ((PageHeader) page)->pd_special;
-	guard->page_flags = ((PageHeader) page)->pd_flags;
+	guard->page_flags = cluster_heap_dml_authority_page_flags(page);
 	guard->max_offset = PageGetMaxOffsetNumber(page);
 	if (tuple != NULL)
 	{
@@ -444,45 +518,119 @@ cluster_heap_dml_authority_guard_bind_itl_slot(
 }
 
 
+static uint32
+cluster_heap_dml_authority_guard_mismatch(
+	Buffer buffer, const ClusterHeapDmlAuthorityGuard *guard)
+{
+	ClusterPcmOwnSnapshot live = {0};
+	uint32 mismatch = 0;
+	Page page;
+	ItemId lp;
+
+	/* Keep each bit stable: the heap_update error detail is also the live
+	 * diagnostic for an unlock/relock authority race. */
+	if (!BufferIsValid(buffer) || guard == NULL || !guard->valid)
+		return UINT32_C(1) << 0;
+	if (cluster_epoch_get_current() != guard->acquisition_epoch)
+		mismatch |= UINT32_C(1) << 1;
+	if (cluster_bufmgr_pcm_own_snapshot(
+			GetBufferDescriptor(buffer - 1), &live) != CLUSTER_PCM_OWN_OK)
+		mismatch |= UINT32_C(1) << 2;
+	else
+	{
+		if (!BufferTagsEqual(&live.tag, &guard->pcm.tag))
+			mismatch |= UINT32_C(1) << 3;
+		if (live.generation != guard->pcm.generation)
+			mismatch |= UINT32_C(1) << 4;
+		if (live.reservation_token != guard->pcm.reservation_token)
+			mismatch |= UINT32_C(1) << 5;
+		if (live.resource_x_activation_generation
+				!= guard->pcm.resource_x_activation_generation)
+			mismatch |= UINT32_C(1) << 6;
+		if (live.flags != guard->pcm.flags)
+			mismatch |= UINT32_C(1) << 7;
+		if (live.pcm_state != guard->pcm.pcm_state)
+			mismatch |= UINT32_C(1) << 8;
+	}
+	page = BufferGetPage(buffer);
+	if (((PageHeader) page)->pd_lower != guard->page_lower)
+		mismatch |= UINT32_C(1) << 9;
+	if (((PageHeader) page)->pd_upper != guard->page_upper)
+		mismatch |= UINT32_C(1) << 10;
+	if (((PageHeader) page)->pd_special != guard->page_special)
+		mismatch |= UINT32_C(1) << 11;
+	if (cluster_heap_dml_authority_page_flags(page) != guard->page_flags)
+		mismatch |= UINT32_C(1) << 12;
+	if (PageGetMaxOffsetNumber(page) != guard->max_offset)
+		mismatch |= UINT32_C(1) << 13;
+	if (guard->has_itl_slot
+		&& (!PageHasItl(page)
+			|| guard->itl_slot_index >= CLUSTER_ITL_INITRANS_DEFAULT))
+		mismatch |= UINT32_C(1) << 14;
+	else if (guard->has_itl_slot
+			 && memcmp(&ClusterPageGetItlSlots(page)[guard->itl_slot_index],
+				 &guard->itl_slot, sizeof(guard->itl_slot)) != 0)
+		mismatch |= UINT32_C(1) << 15;
+	if (!guard->has_tuple)
+		return mismatch;
+	if (guard->offnum < FirstOffsetNumber
+		|| guard->offnum > PageGetMaxOffsetNumber(page))
+		return mismatch | (UINT32_C(1) << 16);
+	lp = PageGetItemId(page, guard->offnum);
+	if (!ItemIdIsNormal(lp))
+		return mismatch | (UINT32_C(1) << 17);
+	if (memcmp(lp, &guard->line_pointer, sizeof(*lp)) != 0)
+		mismatch |= UINT32_C(1) << 18;
+	if (ItemIdGetLength(lp) != guard->tuple_len)
+		mismatch |= UINT32_C(1) << 19;
+	else if (memcmp(PageGetItem(page, lp), guard->tuple_header,
+					SizeofHeapTupleHeader) != 0)
+		mismatch |= UINT32_C(1) << 20;
+	return mismatch;
+}
+
 static bool
 cluster_heap_dml_authority_guard_recheck(
 	Buffer buffer, const ClusterHeapDmlAuthorityGuard *guard)
 {
-	ClusterPcmOwnSnapshot live;
-	Page page;
-	ItemId lp;
-
-	if (!BufferIsValid(buffer) || guard == NULL || !guard->valid
-		|| cluster_epoch_get_current() != guard->acquisition_epoch
-		|| cluster_bufmgr_pcm_own_snapshot(
-			GetBufferDescriptor(buffer - 1), &live) != CLUSTER_PCM_OWN_OK
-		|| memcmp(&live, &guard->pcm, sizeof(live)) != 0)
-		return false;
-	page = BufferGetPage(buffer);
-	if (((PageHeader) page)->pd_lower != guard->page_lower
-		|| ((PageHeader) page)->pd_upper != guard->page_upper
-		|| ((PageHeader) page)->pd_special != guard->page_special
-		|| ((PageHeader) page)->pd_flags != guard->page_flags
-		|| PageGetMaxOffsetNumber(page) != guard->max_offset)
-		return false;
-	if (guard->has_itl_slot
-		&& (!PageHasItl(page)
-			|| guard->itl_slot_index >= CLUSTER_ITL_INITRANS_DEFAULT
-			|| memcmp(&ClusterPageGetItlSlots(page)[guard->itl_slot_index],
-				&guard->itl_slot, sizeof(guard->itl_slot)) != 0))
-		return false;
-	if (!guard->has_tuple)
-		return true;
-	if (guard->offnum < FirstOffsetNumber
-		|| guard->offnum > PageGetMaxOffsetNumber(page))
-		return false;
-	lp = PageGetItemId(page, guard->offnum);
-	return ItemIdIsNormal(lp)
-		&& memcmp(lp, &guard->line_pointer, sizeof(*lp)) == 0
-		&& ItemIdGetLength(lp) == guard->tuple_len
-		&& memcmp(PageGetItem(page, lp), guard->tuple_header,
-			SizeofHeapTupleHeader) == 0;
+	return cluster_heap_dml_authority_guard_mismatch(buffer, guard) == 0;
 }
+
+static bool
+cluster_heap_ctrc_capture_predecessor_page_version(
+	Page page, ClusterCtrcTargetV1 *target)
+{
+	XLogRecPtr page_lsn;
+	SCN page_scn;
+	int page_lsn_origin;
+
+	if (page == NULL || target == NULL)
+		return false;
+	page_lsn = PageGetLSN(page);
+	page_scn = ((PageHeader)page)->pd_block_scn;
+	target->predecessor_page_lsn = page_lsn;
+	target->predecessor_page_scn = page_scn;
+	if (!SCN_VALID(page_scn))
+	{
+		target->predecessor_page_lsn_origin_node_id
+			= CLUSTER_CTRC_PAGE_LSN_ORIGIN_INVALID;
+		/* initdb/base-backup runs before cluster.node_id exists.  Such a
+		 * page can carry a native PostgreSQL LSN but has no cluster WAL
+		 * origin and no block SCN.  Preserve the LSN as evidence while
+		 * classifying the pair as the one-way bootstrap predecessor. */
+		return XLogRecPtrIsInvalid(page_lsn)
+			|| !PageGetLSNOrigin(page, &page_lsn_origin);
+	}
+	if (XLogRecPtrIsInvalid(page_lsn)
+		|| !PageGetLSNOrigin(page, &page_lsn_origin)
+		|| page_lsn_origin < 0
+		|| page_lsn_origin >= CLUSTER_CTRC_MAX_PARTICIPANTS)
+		return false;
+	target->predecessor_page_lsn_origin_node_id
+		= (uint16)page_lsn_origin;
+	return true;
+}
+
 
 static bool
 cluster_heap_ctrc_pending_itl_target(
@@ -508,11 +656,77 @@ cluster_heap_ctrc_pending_itl_target(
 	target->rel_number = guard->pcm.tag.relNumber;
 	target->fork_number = guard->pcm.tag.forkNum;
 	target->block_number = guard->pcm.tag.blockNum;
-	target->predecessor_page_lsn = PageGetLSN(page);
-	target->predecessor_page_scn = ((PageHeader)page)->pd_block_scn;
+	if (!cluster_heap_ctrc_capture_predecessor_page_version(page, target))
+		return false;
 	target->publication_own_generation = guard->pcm.generation;
 	target->publication_acquisition_epoch = guard->acquisition_epoch;
 	return true;
+}
+
+static bool
+cluster_heap_ctrc_stage_reusable_itl_receipt(
+	Relation relation, Buffer buffer, TransactionId xid, bool lock_only,
+	ClusterUndoRecordPrepareReceipt *receipt, uint8 target_ordinal,
+	const ClusterCtrcTargetV1 *pending_target)
+{
+	ClusterCtrcItlTargetIdentity current_target;
+	ClusterCtrcReceiptHandle ctrc_handle;
+	ClusterItlTouchHandle touch_handle;
+	const ClusterItlSlotData *slot;
+	uint8 current_slot_sha256[32];
+	uint8 slot_index = CLUSTER_ITL_SLOT_UNALLOCATED;
+	Page page;
+
+	if (relation == NULL || !BufferIsValid(buffer)
+		|| !TransactionIdIsValid(xid) || receipt == NULL
+		|| pending_target == NULL
+		|| target_ordinal >= CLUSTER_UNDO_RECORD_CTRC_TARGETS
+		|| !cluster_heap_itl_alloc_once(
+			buffer, xid, lock_only, &slot_index))
+		return false;
+	page = BufferGetPage(buffer);
+	if (!PageHasItl(page) || slot_index >= CLUSTER_ITL_INITRANS_DEFAULT)
+		return false;
+	slot = &ClusterPageGetItlSlots(page)[slot_index];
+	if (slot->xid != xid
+		|| slot->flags != (lock_only
+			? ITL_FLAG_LOCK_ONLY_ACTIVE : ITL_FLAG_ACTIVE)
+		|| UBA_is_invalid(slot->undo_segment_head)
+		|| !cluster_ctrc_sha256_exact(slot, sizeof(*slot),
+			current_slot_sha256))
+		return false;
+
+	MemSet(&touch_handle, 0, sizeof(touch_handle));
+	touch_handle.rloc = relation->rd_locator;
+	touch_handle.block = BufferGetBlockNumber(buffer);
+	touch_handle.forknum = MAIN_FORKNUM;
+	touch_handle.slot_idx = slot_index;
+	touch_handle.flags = RelationNeedsWAL(relation)
+		? CLUSTER_ITL_TOUCH_FLAG_NEEDS_WAL : 0;
+	MemSet(&ctrc_handle, 0, sizeof(ctrc_handle));
+	if (!cluster_itl_touch_lookup_reusable_ctrc(
+			&touch_handle, buffer, xid, &ctrc_handle))
+		return false;
+
+	MemSet(&current_target, 0, sizeof(current_target));
+	current_target.spc_oid = pending_target->spc_oid;
+	current_target.db_oid = pending_target->db_oid;
+	current_target.rel_number = pending_target->rel_number;
+	current_target.fork_number = pending_target->fork_number;
+	current_target.block_number = pending_target->block_number;
+	current_target.itl_xid = slot->xid;
+	current_target.itl_slot_index = slot_index;
+	current_target.itl_slot_wrap = slot->wrap;
+	current_target.itl_class = lock_only ? 2 : 1;
+	current_target.needs_wal = pending_target->needs_wal;
+	memcpy(current_target.uba, &slot->undo_segment_head,
+		sizeof(slot->undo_segment_head));
+	if (!cluster_ctrc_receipt_itl_reuse_candidate_shared(
+			&ctrc_handle, pending_target, &current_target,
+			current_slot_sha256))
+		return false;
+	return cluster_undo_record_ctrc_stage_reuse(
+		receipt, target_ordinal, &ctrc_handle);
 }
 
 
@@ -539,8 +753,8 @@ cluster_heap_ctrc_pending_offnum_target(
 	target->rel_number = guard->pcm.tag.relNumber;
 	target->fork_number = guard->pcm.tag.forkNum;
 	target->block_number = guard->pcm.tag.blockNum;
-	target->predecessor_page_lsn = PageGetLSN(page);
-	target->predecessor_page_scn = ((PageHeader)page)->pd_block_scn;
+	if (!cluster_heap_ctrc_capture_predecessor_page_version(page, target))
+		return false;
 	target->publication_own_generation = guard->pcm.generation;
 	target->publication_acquisition_epoch = guard->acquisition_epoch;
 	return true;
@@ -995,7 +1209,8 @@ static bool
 cluster_heap_itl_receipt_identity_admitted(TransactionId canonical_xid,
 										   uint32 segment_id)
 {
-	return TransactionIdIsNormal(canonical_xid) && segment_id != 0;
+	return TransactionIdIsNormal(canonical_xid)
+		&& segment_id != 0 && segment_id <= UINT16_MAX;
 }
 
 
@@ -1038,6 +1253,15 @@ cluster_heap_test_update_needs_successor_prediction(
 	return cluster_heap_update_needs_successor_prediction(
 		current_itl_path, current_mx_recomposed);
 }
+
+bool
+cluster_heap_test_itl_relation_route(
+	bool storage_mode, bool uses_local_buffers, bool shared_catalog,
+	RelFileNumber rel_number)
+{
+	return cluster_heap_itl_relation_route(
+		storage_mode, uses_local_buffers, shared_catalog, rel_number);
+}
 #endif
 
 
@@ -1072,10 +1296,21 @@ cluster_heap_itl_prepare_prepared_undo(
 		if (!cluster_undo_record_ctrc_stage_pending(
 				receipt, 0, &pending_target))
 			return CLUSTER_HEAP_PREPARED_UNDO_REFUSED;
+	}
+	else if (memcmp(&receipt->ctrc_pending_targets[0], &pending_target,
+				  sizeof(pending_target)) != 0)
+		return receipt->ctrc_applied_mask == 0
+			? CLUSTER_HEAP_PREPARED_UNDO_RETRY_REQUIRED
+			: CLUSTER_HEAP_PREPARED_UNDO_REFUSED;
+	if ((receipt->ctrc_prepared_mask & UINT8_C(1)) == 0)
+	{
+		if (cluster_heap_ctrc_stage_reusable_itl_receipt(
+				relation, buffer, xid, lock_only, receipt, 0,
+				&pending_target))
+			return CLUSTER_HEAP_PREPARED_UNDO_READY;
 		return CLUSTER_HEAP_PREPARED_UNDO_RETRY_REQUIRED;
 	}
-	if ((receipt->ctrc_prepared_mask & UINT8_C(1)) == 0
-		|| !cluster_undo_record_ctrc_pending_matches(
+	if (!cluster_undo_record_ctrc_pending_matches(
 			receipt, 0, &pending_target))
 		return receipt->ctrc_applied_mask == 0
 			? CLUSTER_HEAP_PREPARED_UNDO_RETRY_REQUIRED
@@ -1176,10 +1411,11 @@ cluster_heap_itl_prepared_undo_target_recheck(
 static ClusterCtrcApplyResult
 cluster_heap_itl_apply_prepared_undo_target(
 	ClusterUndoRecordPrepareReceipt *receipt,
-	const ClusterHeapPreparedUndoTargetPlan *plan, bool *any_applied)
+	ClusterHeapPreparedUndoTargetPlan *plan, bool *any_applied)
 {
 	ClusterCtrcApplyToken token;
 	ClusterCtrcApplyResult result;
+	uint8 target_bit;
 
 	if (receipt == NULL || plan == NULL || !plan->valid
 		|| any_applied == NULL)
@@ -1190,8 +1426,15 @@ cluster_heap_itl_apply_prepared_undo_target(
 	if (result == CLUSTER_CTRC_APPLY_APPLIED)
 	{
 		*any_applied = true;
-		if (!token.valid)
+		target_bit = UINT8_C(1) << plan->target_ordinal;
+		if (!token.valid
+			|| (receipt->ctrc_pending_mask & target_bit) == 0
+			|| (receipt->ctrc_prepared_mask & target_bit) == 0
+			|| (receipt->ctrc_applied_mask & target_bit) == 0
+			|| !receipt->ctrc_handles[plan->target_ordinal].valid)
 			return CLUSTER_CTRC_APPLY_FAIL_CLOSED;
+		plan->applied_handle
+			= receipt->ctrc_handles[plan->target_ordinal];
 	}
 	return result;
 }
@@ -1314,7 +1557,9 @@ cluster_heap_test_dml_authority_guard_slot_recheck_with_hook(
 static inline bool
 cluster_itl_lock_path_enabled(Relation relation)
 {
-	return cluster_storage_mode_enabled() && !RelationUsesLocalBuffers(relation);
+	return cluster_heap_itl_relation_route(
+		cluster_storage_mode_enabled(), RelationUsesLocalBuffers(relation),
+		cluster_shared_catalog, relation->rd_locator.relNumber);
 }
 #endif
 
@@ -1400,6 +1645,7 @@ typedef struct ClusterCurrentMxDescriptorMemo
 typedef struct ClusterCurrentMxOperationState
 {
 	uint64		operation_id;
+	uint64		wait_deadline_mono_us;
 	uint32		restarts;
 	bool		active;
 	bool		finished;
@@ -3179,7 +3425,8 @@ typedef struct HeapHotCurrentMxCapture
 typedef struct HeapHotCurrentMxSuccessorProof
 {
 	ItemPointerData tid;
-	ClusterTTStatusKey key;
+	ClusterCurrentMxSuccessorAlias alias;
+	ClusterTxLocator locator;
 	TransactionId updater_xid;
 	bool		valid;
 } HeapHotCurrentMxSuccessorProof;
@@ -3237,7 +3484,26 @@ static bool
 heap_hot_current_mx_capture_equal(const HeapHotCurrentMxCapture *left,
 								  const HeapHotCurrentMxCapture *right)
 {
-	return memcmp(left, right, sizeof(*left)) == 0;
+	return cluster_heap_pcm_authority_equal(&left->pcm, &right->pcm)
+		&& left->page_lsn == right->page_lsn
+		&& memcmp(&left->tid, &right->tid, sizeof(left->tid)) == 0
+		&& memcmp(&left->line_pointer, &right->line_pointer,
+				  sizeof(left->line_pointer)) == 0
+		&& left->tuple_len == right->tuple_len
+		&& memcmp(left->tuple_header, right->tuple_header,
+				  sizeof(left->tuple_header)) == 0
+		&& memcmp(left->itl_slots, right->itl_slots,
+				  sizeof(left->itl_slots)) == 0;
+}
+
+/* Clean Stage-8 four-node formation intentionally uses epoch zero until a
+ * reconfiguration advances it.  In every other topology zero is not a
+ * derivable current-MX identity. */
+static bool
+cluster_current_mx_epoch_supported(uint64 epoch)
+{
+	return epoch <= UINT32_MAX
+		&& (epoch != 0 || cluster_conf_node_count() == 4);
 }
 
 static bool
@@ -3277,6 +3543,8 @@ heap_hot_current_mx_build_challenge(
 	ItemId		lp;
 	HeapTupleData candidate;
 	ClusterUndoTTSlotRef ref;
+	ClusterTxLocator locator;
+	ClusterTxResolveReason locator_reason;
 	int			updater_origin;
 
 	if (ItemPointerEquals(&root->t_self, &candidate_tid)
@@ -3299,6 +3567,9 @@ heap_hot_current_mx_build_challenge(
 		|| candidate.t_data->t_itl_slot_idx == CLUSTER_ITL_SLOT_UNALLOCATED
 		|| !cluster_itl_get_tt_ref(page, candidate.t_data->t_itl_slot_idx,
 								  &ref)
+		|| !cluster_tx_locator_from_itl(
+			page, candidate.t_data->t_itl_slot_idx, &locator,
+			&locator_reason)
 		|| ref.tt_slot_id == 0 || ref.local_xid != updater_xid
 		|| ref.cluster_epoch != cluster_epoch_get_current())
 		return false;
@@ -3310,14 +3581,19 @@ heap_hot_current_mx_build_challenge(
 		return false;
 
 	memset(challenge, 0, sizeof(*challenge));
-	challenge->candidate_next_xmin_key.origin_node_id = ref.origin_node_id;
-	challenge->candidate_next_xmin_key.undo_segment_id = ref.undo_segment_id;
-	challenge->candidate_next_xmin_key.tt_slot_id = ref.tt_slot_id;
-	challenge->candidate_next_xmin_key.cluster_epoch = ref.cluster_epoch;
-	challenge->candidate_next_xmin_key.local_xid = ref.local_xid;
+	challenge->candidate_next_xmin_alias.origin_node_id = ref.origin_node_id;
+	challenge->candidate_next_xmin_alias.undo_record_segment_id
+		= ref.undo_segment_id;
+	challenge->candidate_next_xmin_alias.tt_slot_id = ref.tt_slot_id;
+	challenge->candidate_next_xmin_alias.cluster_epoch = ref.cluster_epoch;
+	challenge->candidate_next_xmin_alias.local_xid = ref.local_xid;
+	challenge->candidate_next_xmin_locator = locator;
 	challenge->updater_xid = updater_xid;
 	challenge->member_ordinal = updater_ordinal;
-	return true;
+	return cluster_multixact_current_successor_provenance_well_formed(
+		&challenge->candidate_next_xmin_alias,
+		&challenge->candidate_next_xmin_locator, updater_xid,
+		(uint16) updater_origin, ref.cluster_epoch);
 }
 
 static bool
@@ -3326,7 +3602,9 @@ heap_hot_current_mx_successor_matches(
 	const HeapHotCurrentMxSuccessorProof *proof)
 {
 	ClusterUndoTTSlotRef ref;
-	ClusterTTStatusKey key;
+	ClusterCurrentMxSuccessorAlias alias;
+	ClusterTxLocator locator;
+	ClusterTxResolveReason locator_reason;
 
 	if (proof == NULL || !proof->valid
 		|| !ItemPointerEquals(&tuple->t_self, (ItemPointer) &proof->tid)
@@ -3334,15 +3612,19 @@ heap_hot_current_mx_successor_matches(
 								proof->updater_xid)
 		|| tuple->t_data->t_itl_slot_idx == CLUSTER_ITL_SLOT_UNALLOCATED
 		|| !cluster_itl_get_tt_ref(BufferGetPage(buffer),
-								  tuple->t_data->t_itl_slot_idx, &ref))
+								  tuple->t_data->t_itl_slot_idx, &ref)
+		|| !cluster_tx_locator_from_itl(
+			BufferGetPage(buffer), tuple->t_data->t_itl_slot_idx,
+			&locator, &locator_reason))
 		return false;
-	memset(&key, 0, sizeof(key));
-	key.origin_node_id = ref.origin_node_id;
-	key.undo_segment_id = ref.undo_segment_id;
-	key.tt_slot_id = ref.tt_slot_id;
-	key.cluster_epoch = ref.cluster_epoch;
-	key.local_xid = ref.local_xid;
-	return memcmp(&key, &proof->key, sizeof(key)) == 0;
+	memset(&alias, 0, sizeof(alias));
+	alias.origin_node_id = ref.origin_node_id;
+	alias.undo_record_segment_id = ref.undo_segment_id;
+	alias.tt_slot_id = ref.tt_slot_id;
+	alias.cluster_epoch = ref.cluster_epoch;
+	alias.local_xid = ref.local_xid;
+	return memcmp(&alias, &proof->alias, sizeof(alias)) == 0
+		&& memcmp(&locator, &proof->locator, sizeof(locator)) == 0;
 }
 
 /*
@@ -3396,7 +3678,7 @@ heap_hot_current_mx_resolve_updater(
 	raw_mxid = (MultiXactId) HeapTupleHeaderGetRawXmax(root->t_data);
 	current_epoch = cluster_epoch_get_current();
 	mx_origin = cluster_mxid_origin_slot(raw_mxid);
-	if (current_epoch == 0 || current_epoch > UINT32_MAX
+	if (!cluster_current_mx_epoch_supported(current_epoch)
 		|| mx_origin < 0 || mx_origin >= CLUSTER_MAX_NODES)
 		heap_hot_current_mx_fail(
 			"DESCRIBE",
@@ -3503,7 +3785,8 @@ heap_hot_current_mx_resolve_updater(
 
 	*updater_xid = members[updater_ordinal].xid;
 	successor_proof->tid = candidate_tid;
-	successor_proof->key = challenge.candidate_next_xmin_key;
+	successor_proof->alias = challenge.candidate_next_xmin_alias;
+	successor_proof->locator = challenge.candidate_next_xmin_locator;
 	successor_proof->updater_xid = *updater_xid;
 	successor_proof->valid = true;
 	return true;
@@ -4385,6 +4668,7 @@ heap_insert(Relation relation, HeapTuple tup, CommandId cid,
 	SCN			cluster_itl_write_scn = InvalidScn;
 	ClusterCanonicalTxnBinding canonical_binding = {0};
 	ClusterUndoRecordPrepareReceipt undo_receipt = {0};
+	ClusterCtrcReceiptHandle cluster_itl_ctrc_handle = {0};
 	uint64		undo_prepare_deadline_us = 0;
 	TransactionId canonical_xid = InvalidTransactionId;
 #endif
@@ -4561,7 +4845,19 @@ cluster_heap_insert_retry:
 			if (undo_result != CLUSTER_HEAP_PREPARED_UNDO_READY)
 				ereport(ERROR,
 						(errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
-						 errmsg("cluster undo receipt preparation failed for heap_insert")));
+						 errmsg("cluster undo receipt preparation failed for heap_insert"),
+						 errdetail("result=%u receipt_magic=%u record_type=%u owner_instance=%u tt_segment=%u tt_slot=%u actual_segment=%u pending_mask=%u prepared_mask=%u applied_mask=%u deadline=" UINT64_FORMAT " now=" UINT64_FORMAT,
+							(unsigned int)undo_result, undo_receipt.magic,
+							(unsigned int)undo_receipt.record_type,
+							(unsigned int)undo_receipt.owner_instance,
+							(unsigned int)undo_receipt.tt_slot_segment_id,
+							(unsigned int)undo_receipt.tt_slot_offset,
+							undo_receipt.actual_segment_id,
+							(unsigned int)undo_receipt.ctrc_pending_mask,
+							(unsigned int)undo_receipt.ctrc_prepared_mask,
+							(unsigned int)undo_receipt.ctrc_applied_mask,
+							undo_receipt.absolute_deadline_us,
+							(uint64)GetCurrentTimestamp())));
 			cluster_itl_undo_ready = true;
 		}
 	}
@@ -4585,6 +4881,7 @@ cluster_heap_insert_retry:
 	}
 
 #ifdef USE_PGRAC_CLUSTER
+	MemSet(&cluster_itl_ctrc_handle, 0, sizeof(cluster_itl_ctrc_handle));
 	{
 		ClusterHeapPreparedUndoTargetPlan undo_plan;
 		ClusterHeapNoRetryBoundaryResult boundary_result;
@@ -4681,16 +4978,39 @@ cluster_heap_insert_retry:
 			goto cluster_heap_insert_retry;
 		}
 		if (boundary_result != CLUSTER_HEAP_BOUNDARY_APPLIED)
+		{
+			const ClusterCtrcReceiptHandle *failed_handle
+				= &undo_receipt.ctrc_handles[0];
+			uint32 failed_receipt_state = UINT32_MAX;
+			uint32 failed_participant_state = UINT32_MAX;
+
+			if (failed_handle->valid && failed_handle->receipt != NULL)
+				failed_receipt_state = pg_atomic_read_u32(
+					(pg_atomic_uint32 *)&failed_handle->receipt->state);
+			if (failed_handle->valid && failed_handle->participant != NULL)
+				failed_participant_state = failed_handle->participant->state;
 			ereport(ERROR,
 					(errcode(ERRCODE_CLUSTER_CROSS_NODE_WRITE_CONFLICT),
-					 errmsg("heap insert receipt boundary was refused")));
+					 errmsg("heap insert receipt boundary was refused"),
+					 errdetail("pending_mask=%u prepared_mask=%u applied_mask=%u reuse_mask=%u handle_valid=%d receipt_state=%u participant_state=%u deadline=" UINT64_FORMAT " now=" UINT64_FORMAT,
+						(unsigned int)undo_receipt.ctrc_pending_mask,
+						(unsigned int)undo_receipt.ctrc_prepared_mask,
+						(unsigned int)undo_receipt.ctrc_applied_mask,
+						(unsigned int)undo_receipt.ctrc_reuse_mask,
+						failed_handle->valid,
+						failed_receipt_state,
+						failed_participant_state,
+						undo_receipt.absolute_deadline_us,
+						(uint64)GetCurrentTimestamp())));
+		}
 		if (undo_plan_count > 0)
 		{
 			if (UBA_is_invalid(undo_uba))
 				ereport(ERROR,
 						(errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
-						 errmsg("heap insert undo consume failed after receipt APPLY")));
+					 errmsg("heap insert undo consume failed after receipt APPLY")));
 			cluster_itl_uba = undo_uba;
+			cluster_itl_ctrc_handle = undo_plan.applied_handle;
 		}
 		if (cluster_itl_active)
 			heaptup->t_data->t_itl_slot_idx = cluster_itl_slot;
@@ -4874,7 +5194,7 @@ cluster_heap_insert_retry:
 		handle.flags = RelationNeedsWAL(relation) ? CLUSTER_ITL_TOUCH_FLAG_NEEDS_WAL : 0;
 		cluster_itl_touch_register_exact_ctrc(
 			&handle, buffer, canonical_xid,
-			cluster_heap_ctrc_applied_handle(&undo_receipt, 0));
+			cluster_heap_ctrc_retained_handle(&cluster_itl_ctrc_handle));
 	}
 #endif
 
@@ -5806,25 +6126,42 @@ static bool
 cluster_current_mx_capture_equal(const ClusterCurrentMxHeapFingerprint *left,
 								 const ClusterCurrentMxHeapFingerprint *right)
 {
-	return memcmp(left, right, sizeof(*left)) == 0;
+	return cluster_heap_pcm_authority_equal(&left->pcm, &right->pcm)
+		&& left->page_lsn == right->page_lsn
+		&& memcmp(&left->tid, &right->tid, sizeof(left->tid)) == 0
+		&& memcmp(&left->line_pointer, &right->line_pointer,
+				  sizeof(left->line_pointer)) == 0
+		&& left->tuple_len == right->tuple_len
+		&& memcmp(left->tuple_header, right->tuple_header,
+				  sizeof(left->tuple_header)) == 0
+		&& memcmp(left->itl_slots, right->itl_slots,
+				  sizeof(left->itl_slots)) == 0;
 }
 
 static void
 cluster_current_mx_set_successor_proof(
 	ClusterHeapSuccessorProof *proof, const ItemPointerData *tid,
-	TransactionId updater_xid, const ClusterTTStatusKey *key)
+	TransactionId updater_xid,
+	const ClusterCurrentMxSuccessorAlias *alias,
+	const ClusterTxLocator *locator)
 {
 	Assert(proof != NULL);
 	Assert(tid != NULL);
-	Assert(key != NULL);
+	Assert(alias != NULL);
+	Assert(locator != NULL);
 
 	memset(proof, 0, sizeof(*proof));
 	proof->tid = *tid;
 	proof->updater_xid = updater_xid;
-	proof->origin_node_id = key->origin_node_id;
-	proof->undo_segment_id = key->undo_segment_id;
-	proof->tt_slot_id = key->tt_slot_id;
-	proof->cluster_epoch = key->cluster_epoch;
+	proof->origin_node_id = alias->origin_node_id;
+	proof->undo_record_segment_id = alias->undo_record_segment_id;
+	proof->tt_slot_id = alias->tt_slot_id;
+	proof->cluster_epoch = alias->cluster_epoch;
+	proof->locator_uba_raw[0] = locator->uba.raw[0];
+	proof->locator_uba_raw[1] = locator->uba.raw[1];
+	proof->locator_tt_wrap = locator->tt_wrap;
+	proof->locator_itl_kind = locator->itl_kind;
+	proof->locator_itl_slot_index = locator->itl_slot_index;
 	proof->valid = true;
 }
 
@@ -5838,6 +6175,8 @@ cluster_current_mx_successor_key_matches(
 	Buffer buffer, HeapTuple tuple, const ClusterHeapSuccessorProof *proof)
 {
 	ClusterUndoTTSlotRef ref;
+	ClusterTxLocator locator;
+	ClusterTxResolveReason locator_reason;
 
 	if (proof == NULL || !proof->valid
 		|| ItemPointerGetBlockNumber(&tuple->t_self)
@@ -5848,14 +6187,23 @@ cluster_current_mx_successor_key_matches(
 								proof->updater_xid)
 		|| tuple->t_data->t_itl_slot_idx == CLUSTER_ITL_SLOT_UNALLOCATED
 		|| !cluster_itl_get_tt_ref(BufferGetPage(buffer),
-								  tuple->t_data->t_itl_slot_idx, &ref))
+								  tuple->t_data->t_itl_slot_idx, &ref)
+		|| !cluster_tx_locator_from_itl(
+			BufferGetPage(buffer), tuple->t_data->t_itl_slot_idx,
+			&locator, &locator_reason))
 		return false;
 
 	return ref.origin_node_id == proof->origin_node_id
-		&& ref.undo_segment_id == proof->undo_segment_id
+		&& ref.undo_segment_id == proof->undo_record_segment_id
 		&& ref.tt_slot_id == proof->tt_slot_id
 		&& ref.cluster_epoch == proof->cluster_epoch
-		&& ref.local_xid == proof->updater_xid;
+		&& ref.local_xid == proof->updater_xid
+		&& locator.xid == proof->updater_xid
+		&& locator.uba.raw[0] == proof->locator_uba_raw[0]
+		&& locator.uba.raw[1] == proof->locator_uba_raw[1]
+		&& locator.tt_wrap == proof->locator_tt_wrap
+		&& locator.itl_kind == proof->locator_itl_kind
+		&& locator.itl_slot_index == proof->locator_itl_slot_index;
 }
 
 static bool
@@ -5941,6 +6289,8 @@ cluster_current_mx_build_hot_challenge(
 	ItemId		lp;
 	HeapTupleData candidate;
 	ClusterUndoTTSlotRef ref;
+	ClusterTxLocator locator;
+	ClusterTxResolveReason locator_reason;
 	int			updater_origin;
 
 	Assert(ItemPointerGetBlockNumber(&old_tuple->t_self)
@@ -5967,6 +6317,9 @@ cluster_current_mx_build_hot_challenge(
 	if (!TransactionIdEquals(HeapTupleHeaderGetRawXmin(candidate.t_data), updater_xid)
 		|| candidate.t_data->t_itl_slot_idx == CLUSTER_ITL_SLOT_UNALLOCATED
 		|| !cluster_itl_get_tt_ref(page, candidate.t_data->t_itl_slot_idx, &ref)
+		|| !cluster_tx_locator_from_itl(
+			page, candidate.t_data->t_itl_slot_idx, &locator,
+			&locator_reason)
 		|| ref.tt_slot_id == 0 || ref.local_xid != updater_xid
 		|| ref.cluster_epoch != cluster_epoch_get_current())
 		return false;
@@ -5978,14 +6331,19 @@ cluster_current_mx_build_hot_challenge(
 		return false;
 
 	memset(challenge, 0, sizeof(*challenge));
-	challenge->candidate_next_xmin_key.origin_node_id = ref.origin_node_id;
-	challenge->candidate_next_xmin_key.undo_segment_id = ref.undo_segment_id;
-	challenge->candidate_next_xmin_key.tt_slot_id = ref.tt_slot_id;
-	challenge->candidate_next_xmin_key.cluster_epoch = ref.cluster_epoch;
-	challenge->candidate_next_xmin_key.local_xid = ref.local_xid;
+	challenge->candidate_next_xmin_alias.origin_node_id = ref.origin_node_id;
+	challenge->candidate_next_xmin_alias.undo_record_segment_id
+		= ref.undo_segment_id;
+	challenge->candidate_next_xmin_alias.tt_slot_id = ref.tt_slot_id;
+	challenge->candidate_next_xmin_alias.cluster_epoch = ref.cluster_epoch;
+	challenge->candidate_next_xmin_alias.local_xid = ref.local_xid;
+	challenge->candidate_next_xmin_locator = locator;
 	challenge->updater_xid = updater_xid;
 	challenge->member_ordinal = updater_ordinal;
-	return true;
+	return cluster_multixact_current_successor_provenance_well_formed(
+		&challenge->candidate_next_xmin_alias,
+		&challenge->candidate_next_xmin_locator, updater_xid,
+		(uint16) updater_origin, ref.cluster_epoch);
 }
 
 static bool
@@ -6078,7 +6436,7 @@ cluster_current_mx_hot_updater_for_chain(
 	raw_mxid = (MultiXactId) HeapTupleHeaderGetRawXmax(tuple->t_data);
 	current_epoch = cluster_epoch_get_current();
 	mx_origin = cluster_mxid_origin_slot(raw_mxid);
-	if (current_epoch > UINT32_MAX || mx_origin < 0
+	if (!cluster_current_mx_epoch_supported(current_epoch) || mx_origin < 0
 		|| mx_origin >= CLUSTER_MAX_NODES)
 		cluster_current_mx_failclosed(
 			operation,
@@ -6221,7 +6579,8 @@ cluster_current_mx_hot_updater_for_chain(
 	if (successor_proof != NULL)
 		cluster_current_mx_set_successor_proof(
 			successor_proof, &candidate_tid, *updater_xid,
-			&challenge.candidate_next_xmin_key);
+			&challenge.candidate_next_xmin_alias,
+			&challenge.candidate_next_xmin_locator);
 	cluster_multixact_current_stats_bump(CMX_STAT_HOT_PROOF_HIT);
 	cluster_current_mx_operation_finish(operation);
 	return true;
@@ -6380,6 +6739,7 @@ cluster_current_mx_authorize(Relation relation, Buffer buffer, HeapTuple tuple,
 	ClusterMxResolveResult resolve_result;
 	ClusterMxRecomposeResult recompose_result;
 	ClusterCurrentMxDecision decision;
+	ClusterCurrentMxDecisionTrace decision_trace;
 	MultiXactId raw_mxid;
 	uint64 descriptor_hash;
 	uint64 current_epoch;
@@ -6575,9 +6935,9 @@ cluster_current_mx_authorize(Relation relation, Buffer buffer, HeapTuple tuple,
 	ctx.updater_origin_node_id
 		= updater_ordinal >= 0 ? cluster_xid_origin_slot(members[updater_ordinal].xid) : -1;
 
-	decision = cluster_multixact_current_decide(
+	decision = cluster_multixact_current_decide_observed(
 		members, proofs, nmembers, &ctx, have_challenge ? &challenge : NULL,
-		&updater_proof, &wait_key);
+		&updater_proof, &wait_key, &decision_trace);
 	switch (decision)
 	{
 		case CMDL_CONTINUE:
@@ -6634,7 +6994,8 @@ cluster_current_mx_authorize(Relation relation, Buffer buffer, HeapTuple tuple,
 				cluster_current_mx_set_successor_proof(
 					&heap_result->successor_proof, &candidate_tid,
 					heap_result->authoritative_updater,
-					&challenge.candidate_next_xmin_key);
+					&challenge.candidate_next_xmin_alias,
+					&challenge.candidate_next_xmin_locator);
 				cluster_multixact_current_stats_bump(CMX_STAT_HOT_PROOF_HIT);
 			}
 			heap_result->result = TM_Updated;
@@ -6671,7 +7032,8 @@ cluster_current_mx_authorize(Relation relation, Buffer buffer, HeapTuple tuple,
 			cluster_current_mx_set_successor_proof(
 				&heap_result->successor_proof, &candidate_tid,
 				heap_result->authoritative_updater,
-				&challenge.candidate_next_xmin_key);
+				&challenge.candidate_next_xmin_alias,
+				&challenge.candidate_next_xmin_locator);
 			cluster_multixact_current_stats_bump(CMX_STAT_HOT_PROOF_HIT);
 			heap_result->follow_updated_chain = true;
 			heap_result->result = TM_Ok;
@@ -6685,7 +7047,8 @@ cluster_current_mx_authorize(Relation relation, Buffer buffer, HeapTuple tuple,
 			PG_TRY();
 			{
 				txw = cluster_tx_enqueue_wait_current_mx(
-					&wait_key, cluster_ges_request_timeout_ms);
+					&wait_key, cluster_ges_request_timeout_ms,
+					&operation->wait_deadline_mono_us);
 			}
 			PG_CATCH();
 			{
@@ -6705,10 +7068,6 @@ cluster_current_mx_authorize(Relation relation, Buffer buffer, HeapTuple tuple,
 					break;
 				case CLUSTER_TXW_RETRY:
 					cluster_multixact_current_stats_bump(CMX_STAT_WAIT_RETRY);
-					cluster_current_mx_operation_finish(operation);
-					ereport(ERROR,
-							(errcode(ERRCODE_CLUSTER_GRD_SHARD_REMASTERING),
-							 errmsg("current MultiXact wait crossed a PCM-X remaster")));
 					break;
 				case CLUSTER_TXW_TIMEOUT:
 					cluster_multixact_current_stats_bump(CMX_STAT_WAIT_TIMEOUT);
@@ -6737,6 +7096,38 @@ cluster_current_mx_authorize(Relation relation, Buffer buffer, HeapTuple tuple,
 			return CCMH_RESTART;
 		}
 		case CMDL_UNKNOWN:
+			ereport(LOG,
+					(errmsg_internal(
+						"current-MultiXact compositor UNKNOWN: reason=%u ordinal=%d mxid=%u mx_origin=%u nmembers=%u action=%u shape=%u lock_mode=%d desired_status=%d follow=%u wait=%u top_xid=%u current_xid=%u updater_origin=%d challenge=%d precheck=%d",
+						(unsigned int) decision_trace.unknown_reason,
+						decision_trace.member_ordinal, raw_mxid,
+						(unsigned int) key.origin_node_id,
+						(unsigned int) nmembers, (unsigned int) ctx.action,
+						(unsigned int) ctx.tuple_shape, (int) ctx.lock_mode,
+						(int) ctx.desired_status,
+						(unsigned int) ctx.follow_updates,
+						(unsigned int) ctx.wait_for_conflict, ctx.top_xid,
+						ctx.current_member_xid,
+						ctx.updater_origin_node_id, have_challenge,
+						(int) ctx.precheck_result)));
+			if (decision_trace.member_ordinal >= 0
+				&& decision_trace.member_ordinal < nmembers)
+			{
+				int ordinal = decision_trace.member_ordinal;
+
+				ereport(LOG,
+						(errmsg_internal(
+							"current-MultiXact rejected member: ordinal=%d xid=%u status=%u proof_state=%u proof_key_origin=%u proof_key_xid=%u proof_key_segment=%u proof_key_slot=%u proof_ctrc_grant=%u",
+							ordinal, members[ordinal].xid,
+							(unsigned int) members[ordinal].member_status,
+							(unsigned int) proofs[ordinal].state,
+							(unsigned int) proofs[ordinal].key.origin_node_id,
+							proofs[ordinal].key.local_xid,
+							(unsigned int) proofs[ordinal].key.undo_segment_id,
+							proofs[ordinal].key.tt_slot_id,
+							ClusterCurrentMemberProofGetCtrcGrant(
+								&proofs[ordinal]))));
+			}
 			cluster_current_mx_failclosed(
 				operation,
 				CCMH_FAIL_RECOMPOSE,
@@ -6748,6 +7139,12 @@ cluster_current_mx_authorize(Relation relation, Buffer buffer, HeapTuple tuple,
 }
 
 #ifdef USE_CLUSTER_UNIT
+bool
+cluster_heap_test_current_mx_epoch_supported(uint64 epoch)
+{
+	return cluster_current_mx_epoch_supported(epoch);
+}
+
 bool
 cluster_heap_test_current_mx_authorize_keyshare(
 	Relation relation, Buffer buffer, HeapTuple tuple,
@@ -7022,7 +7419,7 @@ cluster_current_mx_stamp_prepare_plan(
 	if (pending_target->kind != CTRC_TARGET_PAGE_PENDING_OFFNUM)
 		return false;
 	epoch = cluster_epoch_get_current();
-	if (epoch == 0 || epoch > UINT32_MAX)
+	if (!cluster_current_mx_epoch_supported(epoch))
 		return false;
 
 	plan->descriptor_mxid = MultiXactIdCreateLocalCurrentMembers(
@@ -7454,6 +7851,11 @@ typedef struct ClusterHeapNoRetryBoundaryTestState
 	uint8 preflight_calls;
 	uint8 apply_calls;
 	uint8 consume_calls;
+	uint8 event_sequence;
+	uint8 last_preflight_event;
+	uint8 first_apply_event;
+	uint8 last_apply_event;
+	uint8 consume_event;
 } ClusterHeapNoRetryBoundaryTestState;
 
 static ClusterHeapNoRetryBoundaryTestState
@@ -7470,6 +7872,7 @@ cluster_heap_boundary_undo_target_recheck(
 
 	Assert(state->active);
 	state->preflight_calls++;
+	state->last_preflight_event = ++state->event_sequence;
 	return state->fail_preflight_call == 0
 		|| state->preflight_calls != state->fail_preflight_call;
 }
@@ -7492,21 +7895,26 @@ cluster_heap_boundary_mx_publication_recheck(
 
 	Assert(state->active);
 	state->preflight_calls++;
+	state->last_preflight_event = ++state->event_sequence;
 	return state->fail_preflight_call == 0
 		|| state->preflight_calls != state->fail_preflight_call;
 }
 
 static ClusterCtrcApplyResult
 cluster_heap_boundary_apply_undo_target(
-	ClusterUndoRecordPrepareReceipt *receipt pg_attribute_unused(),
-	const ClusterHeapPreparedUndoTargetPlan *plan pg_attribute_unused(),
+	ClusterUndoRecordPrepareReceipt *receipt,
+	ClusterHeapPreparedUndoTargetPlan *plan,
 	bool *any_applied)
 {
 	ClusterHeapNoRetryBoundaryTestState *state
 		= &cluster_heap_no_retry_boundary_test_state;
+	uint8 target_bit;
 
 	Assert(state->active);
 	state->apply_calls++;
+	if (state->first_apply_event == 0)
+		state->first_apply_event = state->event_sequence + 1;
+	state->last_apply_event = ++state->event_sequence;
 	if (state->fail_apply_call != 0
 		&& state->apply_calls == state->fail_apply_call)
 	{
@@ -7514,6 +7922,12 @@ cluster_heap_boundary_apply_undo_target(
 			*any_applied = true;
 		return CLUSTER_CTRC_APPLY_RETRY_REQUIRED;
 	}
+	target_bit = UINT8_C(1) << plan->target_ordinal;
+	receipt->ctrc_pending_mask |= target_bit;
+	receipt->ctrc_prepared_mask |= target_bit;
+	receipt->ctrc_applied_mask |= target_bit;
+	receipt->ctrc_handles[plan->target_ordinal].valid = true;
+	plan->applied_handle = receipt->ctrc_handles[plan->target_ordinal];
 	*any_applied = true;
 	return CLUSTER_CTRC_APPLY_APPLIED;
 }
@@ -7528,6 +7942,9 @@ cluster_heap_boundary_apply_mx_publication(
 
 	Assert(state->active);
 	state->apply_calls++;
+	if (state->first_apply_event == 0)
+		state->first_apply_event = state->event_sequence + 1;
+	state->last_apply_event = ++state->event_sequence;
 	if (state->fail_apply_call != 0
 		&& state->apply_calls == state->fail_apply_call)
 	{
@@ -7543,7 +7960,7 @@ cluster_heap_boundary_apply_mx_publication(
 
 static ClusterHeapPreparedUndoResult
 cluster_heap_boundary_consume_undo(
-	ClusterUndoRecordPrepareReceipt *receipt pg_attribute_unused(),
+	ClusterUndoRecordPrepareReceipt *receipt,
 	const ClusterUndoRecordTarget *target pg_attribute_unused(),
 	void *payload pg_attribute_unused(), uint16 payload_len pg_attribute_unused(),
 	const UBA *planned_uba, UBA *undo_uba_out)
@@ -7553,7 +7970,10 @@ cluster_heap_boundary_consume_undo(
 
 	Assert(state->active);
 	state->consume_calls++;
+	state->consume_event = ++state->event_sequence;
 	*undo_uba_out = *planned_uba;
+	/* Match the production consume contract: reservation state is spent. */
+	MemSet(receipt, 0, sizeof(*receipt));
 	return CLUSTER_HEAP_PREPARED_UNDO_APPLIED;
 }
 #else
@@ -7643,6 +8063,20 @@ cluster_heap_no_retry_boundary_apply(
 			return any_applied
 				? CLUSTER_HEAP_BOUNDARY_REFUSED
 				: CLUSTER_HEAP_BOUNDARY_ZERO_APPLY_RETRY;
+	if (undo_plan_count > 0)
+	{
+		ClusterUndoRecordConsumePreflightResult preflight_result;
+
+		preflight_result = cluster_undo_record_consume_preflight(
+			undo_receipt, undo_payload_len);
+		if (preflight_result
+			!= CLUSTER_UNDO_RECORD_CONSUME_PREFLIGHT_READY)
+			return !any_applied
+				&& preflight_result
+					== CLUSTER_UNDO_RECORD_CONSUME_PREFLIGHT_RETRY_REQUIRED
+				? CLUSTER_HEAP_BOUNDARY_ZERO_APPLY_RETRY
+				: CLUSTER_HEAP_BOUNDARY_REFUSED;
+	}
 
 	for (i = 0; i < undo_plan_count; i++)
 	{
@@ -7677,6 +8111,43 @@ cluster_heap_no_retry_boundary_apply(
 
 #ifdef USE_CLUSTER_UNIT
 bool
+cluster_heap_test_prepare_retry_sequence(
+	const ClusterUndoRecordPrepareResult *results, uint8 result_count,
+	uint64 absolute_deadline_us, ClusterHeapPrepareRetryTestReport *report)
+{
+	ClusterUndoRecordPrepareReceipt receipt;
+	UBA prev_uba = InvalidUba_init;
+	bool prepared;
+
+	if (results == NULL || result_count == 0 || report == NULL
+		|| absolute_deadline_us == 0)
+		return false;
+	MemSet(&receipt, 0, sizeof(receipt));
+	MemSet(report, 0, sizeof(*report));
+	MemSet(&cluster_heap_prepare_retry_test_state, 0,
+		sizeof(cluster_heap_prepare_retry_test_state));
+	cluster_heap_prepare_retry_test_state.active = true;
+	cluster_heap_prepare_retry_test_state.deadline_stable = true;
+	cluster_heap_prepare_retry_test_state.result_count = result_count;
+	cluster_heap_prepare_retry_test_state.expected_deadline_us
+		= absolute_deadline_us;
+	cluster_heap_prepare_retry_test_state.results = results;
+	prepared = cluster_heap_prepare_undo_record_exact(
+		UNDO_RECORD_INSERT, 1, 1, 1, prev_uba,
+		absolute_deadline_us, &receipt);
+	report->prepare_calls
+		= cluster_heap_prepare_retry_test_state.prepare_calls;
+	report->deadline_stable
+		= cluster_heap_prepare_retry_test_state.deadline_stable;
+	report->observed_deadline_us
+		= cluster_heap_prepare_retry_test_state.expected_deadline_us;
+	report->terminal_result
+		= cluster_heap_prepare_retry_test_state.terminal_result;
+	cluster_heap_prepare_retry_test_state.active = false;
+	return prepared;
+}
+
+bool
 cluster_heap_test_no_retry_boundary(
 	ClusterHeapNoRetryTestCaller caller, bool final_recheck_drift,
 	bool partial_apply_failure, ClusterHeapNoRetryTestReport *report)
@@ -7696,7 +8167,7 @@ cluster_heap_test_no_retry_boundary(
 	uint8 payload = 1;
 	uint8 i;
 
-	if (report == NULL || final_recheck_drift == partial_apply_failure)
+	if (report == NULL || (final_recheck_drift && partial_apply_failure))
 		return false;
 	switch (caller)
 	{
@@ -7753,7 +8224,7 @@ cluster_heap_test_no_retry_boundary(
 	if (final_recheck_drift)
 		cluster_heap_no_retry_boundary_test_state.fail_preflight_call
 			= total_calls;
-	else
+	else if (partial_apply_failure)
 	{
 		cluster_heap_no_retry_boundary_test_state.fail_apply_call
 			= total_calls > 1 ? 2 : 1;
@@ -7778,6 +8249,18 @@ cluster_heap_test_no_retry_boundary(
 		= cluster_heap_no_retry_boundary_test_state.apply_calls;
 	report->consume_calls
 		= cluster_heap_no_retry_boundary_test_state.consume_calls;
+	report->last_preflight_event
+		= cluster_heap_no_retry_boundary_test_state.last_preflight_event;
+	report->first_apply_event
+		= cluster_heap_no_retry_boundary_test_state.first_apply_event;
+	report->last_apply_event
+		= cluster_heap_no_retry_boundary_test_state.last_apply_event;
+	report->consume_event
+		= cluster_heap_no_retry_boundary_test_state.consume_event;
+	report->retained_undo_handle_count = 0;
+	for (i = 0; i < undo_plan_count; i++)
+		if (undo_plans[i].applied_handle.valid)
+			report->retained_undo_handle_count++;
 	report->retry_edge
 		= result == CLUSTER_HEAP_BOUNDARY_ZERO_APPLY_RETRY;
 	switch (result)
@@ -7804,12 +8287,15 @@ static void
 cluster_current_mx_stamp_published(ClusterCurrentMxStampPlan *plan)
 {
 	ClusterCurrentMxHeapPublishStage next_stage;
+	uint16 i;
 
 	if (plan == NULL || !plan->active)
 		return;
 	Assert(cluster_multixact_current_heap_publish_transition(
 		plan->stage, CMX_HEAP_EVENT_PUBLISH, &next_stage));
 	plan->stage = next_stage;
+	for (i = 0; i < plan->receipt_count; i++)
+		cluster_ctrc_note_publication_after_apply(&plan->handles[i], true);
 	plan->active = false;
 }
 
@@ -7817,14 +8303,18 @@ cluster_current_mx_stamp_published(ClusterCurrentMxStampPlan *plan)
 static bool
 cluster_current_mx_stamp_lock_buffer(
 	Buffer buffer, bool barrier_aware, ClusterBufferBarrierSiteId site,
+	bool *pin_replaced,
 	ClusterCurrentMxStampPlan *first, ClusterCurrentMxStampPlan *second)
 {
 	bool acquired = false;
 
+	if (pin_replaced != NULL)
+		*pin_replaced = false;
 	PG_TRY();
 	{
 		if (barrier_aware)
-			acquired = ClusterLockBufferExclusiveBarrierAware(buffer, site);
+			acquired = ClusterLockBufferExclusiveBarrierAware(
+				buffer, site, pin_replaced);
 		else
 		{
 			LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
@@ -8338,6 +8828,7 @@ heap_delete(Relation relation, ItemPointer tid,
 	bool		cluster_current_mx_recomposed = false;
 	ClusterCanonicalTxnBinding canonical_binding = {0};
 	ClusterUndoRecordPrepareReceipt undo_receipt = {0};
+	ClusterCtrcReceiptHandle cluster_itl_ctrc_handle = {0};
 	bool		cluster_itl_undo_ready = false;
 	uint64		undo_prepare_deadline_us = 0;
 	TransactionId canonical_xid = InvalidTransactionId;
@@ -8875,11 +9366,19 @@ cluster_writer_terminal:				/* PGRAC: spec-7.1a D0 chained result */
 		else
 		{
 			bool vm_acquired;
+			bool vm_pin_replaced = false;
+			RelFileLocator refused_rlocator;
+			ForkNumber refused_forknum;
+			BlockNumber refused_blocknum;
+
+			BufferGetTag(vmbuffer, &refused_rlocator, &refused_forknum,
+						 &refused_blocknum);
 
 			PG_TRY();
 			{
 				vm_acquired = ClusterLockBufferExclusiveBarrierAware(
-					vmbuffer, CLUSTER_BUFFER_BARRIER_SITE_HEAP_DELETE_VM);
+					vmbuffer, CLUSTER_BUFFER_BARRIER_SITE_HEAP_DELETE_VM,
+					&vm_pin_replaced);
 			}
 			PG_CATCH();
 			{
@@ -8891,10 +9390,6 @@ cluster_writer_terminal:				/* PGRAC: spec-7.1a D0 chained result */
 			PG_END_TRY();
 			if (!vm_acquired)
 			{
-			RelFileLocator refused_rlocator;
-			ForkNumber	refused_forknum;
-			BlockNumber refused_blocknum;
-
 			/*
 			 * PGRAC: vm barrier unwind (delete requalify) — this backend
 			 * holds the heap page whose tag sits under a frozen revoke
@@ -8906,8 +9401,6 @@ cluster_writer_terminal:				/* PGRAC: spec-7.1a D0 chained result */
 			 * combo-of-combo) and the abandoned replica-identity copy freed.
 			 */
 			cluster_current_mx_stamp_cancel(&cluster_current_mx_plan);
-			BufferGetTag(vmbuffer, &refused_rlocator, &refused_forknum,
-						 &refused_blocknum);
 			vm_barrier_retries++;
 			cid = pgrac_entry_cid;
 			iscombo = false;
@@ -8924,8 +9417,11 @@ cluster_writer_terminal:				/* PGRAC: spec-7.1a D0 chained result */
 				refused_rlocator, refused_forknum, refused_blocknum,
 				CLUSTER_BUFFER_BARRIER_OUTCOME_POSTCONDITION_OK,
 				CLUSTER_BUFFER_BARRIER_PROOF_CALLER_POST);
-			cluster_heap_vm_barrier_warm(vmbuffer);
-			ReleaseBuffer(vmbuffer);
+			if (!vm_pin_replaced)
+			{
+				cluster_heap_vm_barrier_warm(vmbuffer);
+				ReleaseBuffer(vmbuffer);
+			}
 			vmbuffer = InvalidBuffer;
 			cluster_heap_lock_with_vm_repin(relation, block, buffer, &vmbuffer);
 			ClusterObserveBufferBarrierReceipt(
@@ -8941,6 +9437,7 @@ cluster_writer_terminal:				/* PGRAC: spec-7.1a D0 chained result */
 	}
 
 #ifdef USE_PGRAC_CLUSTER
+	MemSet(&cluster_itl_ctrc_handle, 0, sizeof(cluster_itl_ctrc_handle));
 	{
 		ClusterHeapPreparedUndoTargetPlan undo_plan;
 		ClusterHeapCurrentMxExactPublication mx_publication;
@@ -9093,8 +9590,9 @@ cluster_writer_terminal:				/* PGRAC: spec-7.1a D0 chained result */
 			if (UBA_is_invalid(undo_uba))
 				ereport(ERROR,
 						(errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
-						 errmsg("heap delete undo consume failed after receipt APPLY")));
+					 errmsg("heap delete undo consume failed after receipt APPLY")));
 			cluster_itl_uba = undo_uba;
+			cluster_itl_ctrc_handle = undo_plan.applied_handle;
 		}
 	}
 #endif
@@ -9280,7 +9778,7 @@ cluster_writer_terminal:				/* PGRAC: spec-7.1a D0 chained result */
 		handle.flags = RelationNeedsWAL(relation) ? CLUSTER_ITL_TOUCH_FLAG_NEEDS_WAL : 0;
 		cluster_itl_touch_register_exact_ctrc(
 			&handle, buffer, canonical_xid,
-			cluster_heap_ctrc_applied_handle(&undo_receipt, 0));
+			cluster_heap_ctrc_retained_handle(&cluster_itl_ctrc_handle));
 	}
 #endif
 
@@ -9473,6 +9971,7 @@ heap_update(Relation relation, ItemPointer otid, HeapTuple newtup,
 	bool		cluster_current_mx_recomposed = false;
 	ClusterCanonicalTxnBinding canonical_binding = {0};
 	ClusterUndoRecordPrepareReceipt undo_receipt = {0};
+	ClusterCtrcReceiptHandle cluster_itl_ctrc_handles[2] = {{0}};
 	uint64		undo_prepare_deadline_us = 0;
 	TransactionId canonical_xid = InvalidTransactionId;
 #endif
@@ -10224,23 +10723,27 @@ cluster_writer_terminal:				/* PGRAC: spec-7.1a D0 chained result */
 
 		/* PGRAC: pre-crit VM content lock — see heap_insert. */
 		vm_locked = false;
-		if (PageIsAllVisible(page) && BufferIsValid(vmbuffer))
+	if (PageIsAllVisible(page) && BufferIsValid(vmbuffer))
+	{
+		bool vm_acquired;
+		bool vm_pin_replaced = false;
+		RelFileLocator refused_rlocator;
+		ForkNumber refused_forknum;
+		BlockNumber refused_blocknum;
+
+		BufferGetTag(vmbuffer, &refused_rlocator, &refused_forknum,
+					 &refused_blocknum);
+
+		vm_acquired = cluster_current_mx_stamp_lock_buffer(
+			vmbuffer,
+			vm_barrier_retries < CLUSTER_HEAP_VM_BARRIER_MAX_RETRIES,
+			CLUSTER_BUFFER_BARRIER_SITE_HEAP_UPDATE_PRETOAST_VM,
+			&vm_pin_replaced,
+			cluster_current_mx_recomposed
+				? &cluster_current_mx_temp_lock_plan : NULL,
+			NULL);
+		if (!vm_acquired)
 		{
-			bool vm_acquired;
-
-			vm_acquired = cluster_current_mx_stamp_lock_buffer(
-				vmbuffer,
-				vm_barrier_retries < CLUSTER_HEAP_VM_BARRIER_MAX_RETRIES,
-				CLUSTER_BUFFER_BARRIER_SITE_HEAP_UPDATE_PRETOAST_VM,
-				cluster_current_mx_recomposed
-					? &cluster_current_mx_temp_lock_plan : NULL,
-				NULL);
-			if (!vm_acquired)
-			{
-				RelFileLocator refused_rlocator;
-				ForkNumber	refused_forknum;
-				BlockNumber refused_blocknum;
-
 				/*
 				 * PGRAC: vm barrier unwind (update pre-toast) — the old
 				 * tuple carries no temporary lock yet and nothing
@@ -10249,9 +10752,7 @@ cluster_writer_terminal:				/* PGRAC: spec-7.1a D0 chained result */
 				 * cid: a pass-1 combo cmax must not feed requalification or
 				 * be recombined into a combo-of-combo.
 				 */
-				BufferGetTag(vmbuffer, &refused_rlocator, &refused_forknum,
-							 &refused_blocknum);
-				vm_barrier_retries++;
+			vm_barrier_retries++;
 				cid = pgrac_entry_cid;
 				iscombo = false;
 #ifdef USE_PGRAC_CLUSTER
@@ -10268,9 +10769,12 @@ cluster_writer_terminal:				/* PGRAC: spec-7.1a D0 chained result */
 					refused_rlocator, refused_forknum, refused_blocknum,
 					CLUSTER_BUFFER_BARRIER_OUTCOME_POSTCONDITION_OK,
 					CLUSTER_BUFFER_BARRIER_PROOF_CALLER_POST);
+			if (!vm_pin_replaced)
+			{
 				cluster_heap_vm_barrier_warm(vmbuffer);
 				ReleaseBuffer(vmbuffer);
-				vmbuffer = InvalidBuffer;
+			}
+			vmbuffer = InvalidBuffer;
 				cluster_heap_lock_with_vm_repin(relation, block, buffer, &vmbuffer);
 				ClusterObserveBufferBarrierReceipt(
 					CLUSTER_BUFFER_BARRIER_SITE_HEAP_UPDATE_PRETOAST_VM,
@@ -10766,14 +11270,22 @@ l_pgrac_reacquire:
 			cluster_heap_itl_finish_terminal_census(
 				&cluster_itl_update_census);
 
-		if (!cluster_heap_dml_authority_guard_recheck(
-				buffer, &old_dml_guard)
-			|| (newbuf != buffer && PageHasItl(BufferGetPage(newbuf))
-				&& !cluster_heap_dml_authority_guard_recheck(
-					newbuf, &new_dml_guard)))
-			ereport(ERROR,
-					(errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
-					 errmsg("heap update authority changed during ITL capacity check")));
+		{
+			uint32 old_mismatch = cluster_heap_dml_authority_guard_mismatch(
+				buffer, &old_dml_guard);
+			uint32 new_mismatch
+				= newbuf != buffer && PageHasItl(BufferGetPage(newbuf))
+				? cluster_heap_dml_authority_guard_mismatch(
+					newbuf, &new_dml_guard)
+				: 0;
+
+			if (old_mismatch != 0 || new_mismatch != 0)
+				ereport(ERROR,
+						(errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
+						 errmsg("heap update authority changed during ITL capacity check"),
+						 errdetail("old mismatch=0x%08x, new mismatch=0x%08x",
+								   old_mismatch, new_mismatch)));
+		}
 
 		if (newbuf != buffer && PageHasItl(BufferGetPage(newbuf)))
 			ctrc_required_mask |= UINT8_C(2);
@@ -10788,25 +11300,35 @@ l_pgrac_reacquire:
 			 ctrc_target_ordinal < CLUSTER_UNDO_RECORD_CTRC_TARGETS;
 			 ctrc_target_ordinal++)
 		{
+			Buffer target_buffer;
 			uint8 target_bit = UINT8_C(1) << ctrc_target_ordinal;
 
 			if ((ctrc_required_mask & target_bit) == 0)
 				continue;
+			target_buffer = ctrc_target_ordinal == 0 ? buffer : newbuf;
 			if ((undo_receipt.ctrc_pending_mask & target_bit) == 0)
 			{
 				if (!cluster_undo_record_ctrc_stage_pending(&undo_receipt,
 						ctrc_target_ordinal,
 						&ctrc_pending_targets[ctrc_target_ordinal]))
+				{
 					ctrc_target_mismatch = true;
-				else
-					ctrc_prepare_only = true;
+					continue;
+				}
 			}
 			else if (memcmp(
 						 &undo_receipt.ctrc_pending_targets[ctrc_target_ordinal],
 						 &ctrc_pending_targets[ctrc_target_ordinal],
 						 sizeof(ClusterCtrcTargetV1)) != 0)
+			{
 				ctrc_target_mismatch = true;
-			else if ((undo_receipt.ctrc_prepared_mask & target_bit) == 0)
+				continue;
+			}
+			if ((undo_receipt.ctrc_prepared_mask & target_bit) == 0
+				&& !cluster_heap_ctrc_stage_reusable_itl_receipt(
+					relation, target_buffer, canonical_xid, false,
+					&undo_receipt, ctrc_target_ordinal,
+					&ctrc_pending_targets[ctrc_target_ordinal]))
 				ctrc_prepare_only = true;
 		}
 		if ((undo_receipt.ctrc_pending_mask
@@ -11016,6 +11538,23 @@ l_pgrac_reacquire:
 		bool		barrier_aware = vm_barrier_retries < CLUSTER_HEAP_VM_BARRIER_MAX_RETRIES;
 		Buffer		refused_vm = InvalidBuffer;
 		ClusterBufferBarrierSiteId refused_site = (ClusterBufferBarrierSiteId) 0;
+		bool		refused_pin_replaced = false;
+		RelFileLocator refused_rlocator = {0};
+		ForkNumber refused_forknum = InvalidForkNumber;
+		BlockNumber refused_blocknum = InvalidBlockNumber;
+		RelFileLocator old_vm_rlocator = {0};
+		ForkNumber old_vm_forknum = InvalidForkNumber;
+		BlockNumber old_vm_blocknum = InvalidBlockNumber;
+		RelFileLocator new_vm_rlocator = {0};
+		ForkNumber new_vm_forknum = InvalidForkNumber;
+		BlockNumber new_vm_blocknum = InvalidBlockNumber;
+
+		if (need_old)
+			BufferGetTag(vmbuffer, &old_vm_rlocator, &old_vm_forknum,
+						 &old_vm_blocknum);
+		if (need_new)
+			BufferGetTag(vmbuffer_new, &new_vm_rlocator, &new_vm_forknum,
+						 &new_vm_blocknum);
 
 		if (need_old && need_new && vmbuffer_new == vmbuffer)
 			need_new = false;	/* same map page: one lock covers both */
@@ -11027,11 +11566,13 @@ l_pgrac_reacquire:
 			{
 				(void)cluster_current_mx_stamp_lock_buffer(
 					vmbuffer_new, false, (ClusterBufferBarrierSiteId)0,
+					NULL,
 					&cluster_current_mx_old_plan,
 					&cluster_current_mx_new_plan);
 				vm_locked_new = true;
 				(void)cluster_current_mx_stamp_lock_buffer(
 					vmbuffer, false, (ClusterBufferBarrierSiteId)0,
+					NULL,
 					&cluster_current_mx_old_plan,
 					&cluster_current_mx_new_plan);
 				vm_locked = true;
@@ -11042,6 +11583,7 @@ l_pgrac_reacquire:
 						vmbuffer_new,
 						true,
 						CLUSTER_BUFFER_BARRIER_SITE_HEAP_UPDATE_PAIR_NEW_FIRST,
+						&refused_pin_replaced,
 						&cluster_current_mx_old_plan,
 						&cluster_current_mx_new_plan))
 					vm_locked_new = true;
@@ -11050,6 +11592,11 @@ l_pgrac_reacquire:
 					refused_vm = vmbuffer_new;
 					refused_site =
 						CLUSTER_BUFFER_BARRIER_SITE_HEAP_UPDATE_PAIR_NEW_FIRST;
+					refused_rlocator = new_vm_rlocator;
+					refused_forknum = new_vm_forknum;
+					refused_blocknum = new_vm_blocknum;
+					if (refused_pin_replaced)
+						vmbuffer_new = InvalidBuffer;
 				}
 				if (refused_vm == InvalidBuffer)
 				{
@@ -11057,6 +11604,7 @@ l_pgrac_reacquire:
 							vmbuffer,
 							true,
 							CLUSTER_BUFFER_BARRIER_SITE_HEAP_UPDATE_PAIR_OLD_SECOND,
+							&refused_pin_replaced,
 							&cluster_current_mx_old_plan,
 							&cluster_current_mx_new_plan))
 						vm_locked = true;
@@ -11065,6 +11613,11 @@ l_pgrac_reacquire:
 						refused_vm = vmbuffer;
 						refused_site =
 							CLUSTER_BUFFER_BARRIER_SITE_HEAP_UPDATE_PAIR_OLD_SECOND;
+						refused_rlocator = old_vm_rlocator;
+						refused_forknum = old_vm_forknum;
+						refused_blocknum = old_vm_blocknum;
+						if (refused_pin_replaced)
+							vmbuffer = InvalidBuffer;
 					}
 				}
 			}
@@ -11077,6 +11630,7 @@ l_pgrac_reacquire:
 				{
 					(void)cluster_current_mx_stamp_lock_buffer(
 						vmbuffer, false, (ClusterBufferBarrierSiteId)0,
+						NULL,
 						&cluster_current_mx_old_plan,
 						&cluster_current_mx_new_plan);
 					vm_locked = true;
@@ -11085,6 +11639,7 @@ l_pgrac_reacquire:
 							 vmbuffer,
 							 true,
 							 CLUSTER_BUFFER_BARRIER_SITE_HEAP_UPDATE_OLD,
+							 &refused_pin_replaced,
 							 &cluster_current_mx_old_plan,
 							 &cluster_current_mx_new_plan))
 					vm_locked = true;
@@ -11092,6 +11647,11 @@ l_pgrac_reacquire:
 				{
 					refused_vm = vmbuffer;
 					refused_site = CLUSTER_BUFFER_BARRIER_SITE_HEAP_UPDATE_OLD;
+					refused_rlocator = old_vm_rlocator;
+					refused_forknum = old_vm_forknum;
+					refused_blocknum = old_vm_blocknum;
+					if (refused_pin_replaced)
+						vmbuffer = InvalidBuffer;
 				}
 			}
 			if (need_new && refused_vm == InvalidBuffer)
@@ -11100,6 +11660,7 @@ l_pgrac_reacquire:
 				{
 					(void)cluster_current_mx_stamp_lock_buffer(
 						vmbuffer_new, false, (ClusterBufferBarrierSiteId)0,
+						NULL,
 						&cluster_current_mx_old_plan,
 						&cluster_current_mx_new_plan);
 					vm_locked_new = true;
@@ -11108,6 +11669,7 @@ l_pgrac_reacquire:
 							 vmbuffer_new,
 							 true,
 							 CLUSTER_BUFFER_BARRIER_SITE_HEAP_UPDATE_NEW,
+							 &refused_pin_replaced,
 							 &cluster_current_mx_old_plan,
 							 &cluster_current_mx_new_plan))
 					vm_locked_new = true;
@@ -11115,16 +11677,17 @@ l_pgrac_reacquire:
 				{
 					refused_vm = vmbuffer_new;
 					refused_site = CLUSTER_BUFFER_BARRIER_SITE_HEAP_UPDATE_NEW;
+					refused_rlocator = new_vm_rlocator;
+					refused_forknum = new_vm_forknum;
+					refused_blocknum = new_vm_blocknum;
+					if (refused_pin_replaced)
+						vmbuffer_new = InvalidBuffer;
 				}
 			}
 		}
 
 		if (refused_vm != InvalidBuffer)
 		{
-			RelFileLocator refused_rlocator;
-			ForkNumber	refused_forknum;
-			BlockNumber refused_blocknum;
-
 			/*
 			 * PGRAC: BARRIER_CLOSED caller-owned unwind.  This backend holds
 			 * heap content lock(s) whose tag sits under a frozen revoke
@@ -11137,8 +11700,6 @@ l_pgrac_reacquire:
 			cluster_current_mx_stamp_cancel(&cluster_current_mx_old_plan);
 			cluster_current_mx_stamp_cancel(&cluster_current_mx_new_plan);
 			Assert(refused_site != (ClusterBufferBarrierSiteId) 0);
-			BufferGetTag(refused_vm, &refused_rlocator, &refused_forknum,
-						 &refused_blocknum);
 			vm_barrier_retries++;
 			if (vm_locked_new)
 			{
@@ -11183,8 +11744,10 @@ l_pgrac_reacquire:
 					refused_rlocator, refused_forknum, refused_blocknum,
 					CLUSTER_BUFFER_BARRIER_OUTCOME_POSTCONDITION_OK,
 					CLUSTER_BUFFER_BARRIER_PROOF_CALLER_POST);
-				cluster_heap_vm_barrier_warm(refused_vm);
-				ReleaseBuffer(vmbuffer);
+				if (!refused_pin_replaced)
+					cluster_heap_vm_barrier_warm(refused_vm);
+				if (BufferIsValid(vmbuffer))
+					ReleaseBuffer(vmbuffer);
 				vmbuffer = InvalidBuffer;
 				cluster_heap_lock_with_vm_repin(relation, block, buffer, &vmbuffer);
 				page = BufferGetPage(buffer);
@@ -11221,7 +11784,8 @@ l_pgrac_reacquire:
 				refused_rlocator, refused_forknum, refused_blocknum,
 				CLUSTER_BUFFER_BARRIER_OUTCOME_POSTCONDITION_OK,
 				CLUSTER_BUFFER_BARRIER_PROOF_CALLER_POST);
-			cluster_heap_vm_barrier_warm(refused_vm);
+			if (!refused_pin_replaced)
+				cluster_heap_vm_barrier_warm(refused_vm);
 			ClusterObserveBufferBarrierReceipt(
 				refused_site, CLUSTER_BUFFER_BARRIER_PHASE_REENTRY,
 				refused_rlocator, refused_forknum, refused_blocknum,
@@ -11232,6 +11796,7 @@ l_pgrac_reacquire:
 	}
 
 #ifdef USE_PGRAC_CLUSTER
+	MemSet(cluster_itl_ctrc_handles, 0, sizeof(cluster_itl_ctrc_handles));
 	{
 		ClusterHeapPreparedUndoTargetPlan undo_plans[2];
 		ClusterHeapCurrentMxExactPublication mx_publications[2];
@@ -11525,8 +12090,11 @@ l_pgrac_reacquire:
 			if (UBA_is_invalid(undo_uba))
 				ereport(ERROR,
 						(errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
-						 errmsg("heap update undo consume failed after receipt APPLY")));
+					 errmsg("heap update undo consume failed after receipt APPLY")));
 			cluster_itl_uba = undo_uba;
+			cluster_itl_ctrc_handles[0] = undo_plans[0].applied_handle;
+			if (undo_plan_count == 2)
+				cluster_itl_ctrc_handles[1] = undo_plans[1].applied_handle;
 		}
 	}
 #endif
@@ -11762,7 +12330,8 @@ l_pgrac_reacquire:
 		handle.flags = RelationNeedsWAL(relation) ? CLUSTER_ITL_TOUCH_FLAG_NEEDS_WAL : 0;
 		cluster_itl_touch_register_exact_ctrc(
 			&handle, buffer, canonical_xid,
-			cluster_heap_ctrc_applied_handle(&undo_receipt, 0));
+			cluster_heap_ctrc_retained_handle(
+				&cluster_itl_ctrc_handles[0]));
 	}
 	if (cluster_itl_new_active && newbuf != buffer)
 	{
@@ -11775,7 +12344,8 @@ l_pgrac_reacquire:
 		handle.flags = RelationNeedsWAL(relation) ? CLUSTER_ITL_TOUCH_FLAG_NEEDS_WAL : 0;
 		cluster_itl_touch_register_exact_ctrc(
 			&handle, newbuf, canonical_xid,
-			cluster_heap_ctrc_applied_handle(&undo_receipt, 1));
+			cluster_heap_ctrc_retained_handle(
+				&cluster_itl_ctrc_handles[1]));
 	}
 #endif
 
@@ -12247,6 +12817,7 @@ heap_lock_tuple(Relation relation, HeapTuple tuple,
 	bool		cluster_current_mx_recomposed = false;
 	ClusterCanonicalTxnBinding canonical_binding = {0};
 	ClusterUndoRecordPrepareReceipt undo_receipt = {0};
+	ClusterCtrcReceiptHandle cluster_lock_ctrc_handle = {0};
 	uint64		undo_prepare_deadline_us = 0;
 	TransactionId canonical_xid = InvalidTransactionId;
 #endif
@@ -13663,11 +14234,13 @@ failed:
 	{
 		(void)cluster_current_mx_stamp_lock_buffer(
 			vmbuffer, false, (ClusterBufferBarrierSiteId)0,
+			NULL,
 			&cluster_current_mx_lock_plan, NULL);
 		vm_locked = true;
 	}
 
 #ifdef USE_PGRAC_CLUSTER
+	MemSet(&cluster_lock_ctrc_handle, 0, sizeof(cluster_lock_ctrc_handle));
 	{
 		ClusterHeapPreparedUndoTargetPlan undo_plan;
 		ClusterHeapCurrentMxExactPublication mx_publication;
@@ -13821,8 +14394,9 @@ failed:
 			if (UBA_is_invalid(undo_uba))
 				ereport(ERROR,
 						(errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
-						 errmsg("heap tuple lock undo consume failed after receipt APPLY")));
+					 errmsg("heap tuple lock undo consume failed after receipt APPLY")));
 			cluster_lock_uba = undo_uba;
+			cluster_lock_ctrc_handle = undo_plan.applied_handle;
 		}
 	}
 #endif
@@ -14022,7 +14596,7 @@ failed:
 			CLUSTER_ITL_TOUCH_FLAG_NEEDS_WAL : 0;
 		cluster_itl_touch_register_exact_ctrc(
 			&handle, *buffer, canonical_xid,
-			cluster_heap_ctrc_applied_handle(&undo_receipt, 0));
+			cluster_heap_ctrc_retained_handle(&cluster_lock_ctrc_handle));
 	}
 	if (cluster_did_multixact_member_bind)
 	{
@@ -14524,6 +15098,7 @@ heap_lock_updated_tuple_rec(Relation rel, TransactionId priorXmax,
 	UBA			cluster_chain_uba = InvalidUba_init;
 	SCN			cluster_chain_write_scn = InvalidScn;
 	ClusterUndoRecordPrepareReceipt cluster_chain_receipt = {0};
+	ClusterCtrcReceiptHandle cluster_chain_ctrc_handle = {0};
 	ClusterHeapSuccessorProof expected_successor;
 #endif
 
@@ -14550,6 +15125,8 @@ heap_lock_updated_tuple_rec(Relation rel, TransactionId priorXmax,
 		cluster_chain_uba = (UBA) InvalidUba_init;
 		cluster_chain_write_scn = InvalidScn;
 		MemSet(&cluster_chain_receipt, 0, sizeof(cluster_chain_receipt));
+		MemSet(&cluster_chain_ctrc_handle, 0,
+			sizeof(cluster_chain_ctrc_handle));
 #endif
 
 		if (!heap_fetch(rel, SnapshotAny, &mytup, &buf, false))
@@ -15022,6 +15599,7 @@ l4:
 				cluster_chain_slot_idx = undo_plan.slot_index;
 				cluster_chain_write_scn = undo_plan.write_scn;
 				cluster_chain_uba = undo_uba;
+				cluster_chain_ctrc_handle = undo_plan.applied_handle;
 				cluster_chain_lock_stamp = true;
 			}
 		}
@@ -15155,8 +15733,8 @@ l4:
 				CLUSTER_ITL_TOUCH_FLAG_NEEDS_WAL : 0;
 			cluster_itl_touch_register_exact_ctrc(
 				&chain_handle, buf, canonical_xid,
-				cluster_heap_ctrc_applied_handle(
-					&cluster_chain_receipt, 0));
+				cluster_heap_ctrc_retained_handle(
+					&cluster_chain_ctrc_handle));
 		}
 #endif
 
@@ -16105,6 +16683,19 @@ FreezeMultiXactId(MultiXactId multi, uint16 t_infomask,
 	TransactionId FreezePageRelfrozenXid;
 
 	*flags = 0;
+
+#ifdef USE_PGRAC_CLUSTER
+	/* A striped current descriptor may retain ACTIVE members.  Native freeze
+	 * cannot register its replacement descriptor before changing the tuple,
+	 * so leave that predecessor to the CTRC cleaner's exact Resource-X path. */
+	if (!cluster_ctrc_native_current_mx_mutation_allowed(
+			cluster_peer_mode_enabled(), cluster_mxid_origin_slot(multi)))
+		ereport(ERROR,
+				(errcode(ERRCODE_CLUSTER_MULTIXACT_MEMBER_OVERLAY_MISS),
+				 errmsg("cannot freeze current cluster multixact %u before terminal-reference cleanout",
+						(unsigned) multi),
+				 errhint("Retry after the CTRC cleaner rewrites the current MultiXact reference.")));
+#endif
 
 	/* We should only be called in Multis */
 	Assert(t_infomask & HEAP_XMAX_IS_MULTI);

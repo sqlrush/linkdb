@@ -68,6 +68,7 @@
 #include "cluster/cluster_undo_horizon.h"	 /* cluster floor + fence (spec-5.22e D5-3) */
 #include "cluster/cluster_undo_retention.h"	 /* horizon (C17: once per pass) */
 #include "cluster/cluster_tt_slot.h"		 /* current TT segment (exclusion) */
+#include "cluster/cluster_terminal_ref_census.h"
 #include "cluster/cluster_undo_record_api.h" /* active segment + advance (D3) */
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_undo_cleaner.h"
@@ -383,6 +384,7 @@ undo_cleaner_run_pass(bool *out_work_remaining)
 	ClusterSemanticAdmissionToken modifier_token;
 	bool writable_admission;
 	bool floor_retry_needed = false;
+	bool ctrc_local_progress;
 
 	*out_work_remaining = false;
 
@@ -390,6 +392,16 @@ undo_cleaner_run_pass(bool *out_work_remaining)
 		return false;
 	if (!cluster_storage_mode_enabled())
 		return false;
+
+	/* Spec 8.4D K13: this existing process is the sole CTRC progress owner.
+	 * The helper holds no cleaner/lifecycle/page lock while it samples one
+	 * terminal and stages at most one idempotent close continuation. */
+	ctrc_local_progress = cluster_ctrc_cleaner_run_pass();
+	/* SetLatch notifications coalesce.  A completed local CTRC edge proves
+	 * useful work remains in the bounded pipeline, so keep this sole owner
+	 * running until a pass makes no local progress.  Remote enqueue is not a
+	 * completed edge and is excluded by cluster_ctrc_cleaner_run_pass(). */
+	*out_work_remaining = ctrc_local_progress;
 	writable_admission
 		= cluster_reconfig_self_join_gate_verdict() == CLUSTER_JOIN_GATE_ALLOW;
 	if (cluster_semantic_activation_modifier_enter(writable_admission, &modifier_token)

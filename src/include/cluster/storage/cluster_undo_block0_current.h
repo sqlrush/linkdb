@@ -78,6 +78,11 @@ cluster_undo_block0_current_acquire_begin_admitted(
 	int timeout_ms, const ClusterSemanticAdmissionToken *admission,
 	ClusterUndoBlock0CurrentGuard *guard, ClusterUndoBlock0Result *failure);
 extern ClusterUndoBlock0CurrentStep
+cluster_undo_block0_current_acquire_begin_ctrc_release(
+	const ClusterUndoBlock0LogicalKey *key, int timeout_ms,
+	const ClusterSemanticAdmissionToken *admission,
+	ClusterUndoBlock0CurrentGuard *guard, ClusterUndoBlock0Result *failure);
+extern ClusterUndoBlock0CurrentStep
 cluster_undo_block0_current_acquire_begin_live_owner_source(
 	const ClusterUndoBlock0LogicalKey *key, int timeout_ms,
 	const ClusterSemanticAdmissionToken *admission,
@@ -90,6 +95,8 @@ cluster_undo_block0_current_acquire_begin_live_owner_target(
 extern ClusterUndoBlock0CurrentStep
 cluster_undo_block0_current_acquire_poll(ClusterUndoBlock0CurrentGuard *guard,
 										ClusterUndoBlock0Result *failure);
+extern bool cluster_undo_block0_current_wait_reply(
+	ClusterUndoBlock0CurrentGuard *guard);
 extern void cluster_undo_block0_current_cancel(ClusterUndoBlock0CurrentGuard *guard);
 extern ClusterUndoBlock0CurrentStep
 cluster_undo_block0_current_release_begin(ClusterUndoBlock0CurrentGuard *guard,

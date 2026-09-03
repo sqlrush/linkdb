@@ -37,6 +37,7 @@
 #include "access/xlog.h"
 #include "miscadmin.h"
 #include "utils/elog.h"
+#include "utils/timestamp.h"
 
 #include "cluster/cluster_guc.h"		  /* cluster_node_id */
 #include "cluster/cluster_epoch.h"
@@ -146,7 +147,7 @@ cluster_tt_active_transition_decide(const TTSlot *predecessor,
 	}
 
 	terminal_shape
-		= predecessor->flags == TT_FLAGS_RESERVED
+		= (predecessor->flags & ~TT_SLOT_FLAGS_KNOWN) == 0
 		&& UBA_is_invalid(predecessor->first_undo_block)
 		&& ((predecessor->status == TT_SLOT_COMMITTED
 				 && SCN_VALID(predecessor->commit_scn))
@@ -195,7 +196,7 @@ cluster_tt_terminal_transition_decide(const TTSlot *predecessor,
 		return CLUSTER_TT_TERMINAL_APPLY;
 	}
 
-	terminal_shape = predecessor->flags == TT_FLAGS_RESERVED
+	terminal_shape = (predecessor->flags & ~TT_SLOT_FLAGS_KNOWN) == 0
 		&& UBA_is_invalid(predecessor->first_undo_block)
 		&& ((predecessor->status == TT_SLOT_COMMITTED
 				 && SCN_VALID(predecessor->commit_scn))
@@ -210,7 +211,9 @@ cluster_tt_terminal_transition_decide(const TTSlot *predecessor,
 	if (terminal_status == TT_SLOT_COMMITTED
 		&& predecessor->commit_scn != commit_scn)
 		return CLUSTER_TT_TERMINAL_CONFLICT;
-	return CLUSTER_TT_TERMINAL_IDEMPOTENT;
+	return (predecessor->flags & TT_SLOT_FLAG_CTRC_RELEASE_PROVEN) != 0
+		? CLUSTER_TT_TERMINAL_APPLY
+		: CLUSTER_TT_TERMINAL_IDEMPOTENT;
 }
 
 static bool
@@ -285,6 +288,7 @@ cluster_tt_slot_durable_publish_active(
 	ClusterUndoBlock0CurrentStep step;
 	ClusterUndoBlock0Result current_failure = CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
 	ClusterUndoBlock0Result result;
+	const ClusterGesTimeoutDetail *ges_failure;
 	PGAlignedBlock disk_block;
 	UndoSegmentHeaderData *disk_header = (UndoSegmentHeaderData *)disk_block.data;
 	UndoSegmentHeaderData *resident_header;
@@ -293,10 +297,12 @@ cluster_tt_slot_durable_publish_active(
 	volatile XLogRecPtr bind_lsn = InvalidXLogRecPtr;
 	uint64 publication_epoch;
 	uint64 publication_boot_incarnation;
+	TimestampTz ctrc_reserve_deadline = 0;
 	uint32 ctrc_grant_generation = 0;
 	uint8 owner;
 	bool target_side;
 	bool root_available;
+	bool ctrc_reserve_perpetual;
 	volatile bool current_active = false;
 	volatile bool pin_held = false;
 	volatile bool ctrc_pre_bind_cancel_armed = false;
@@ -341,31 +347,44 @@ cluster_tt_slot_durable_publish_active(
 	key.segment_id = expected_owner->segment_id;
 	key.owner_instance = owner;
 	target_side = admission->side == CLUSTER_SEMANTIC_TARGET_SIDE;
-	root_available = target_side
-		? cluster_semantic_activation_resolve_shared_undo_root(
-			  admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED, owner,
-			  expected_owner->segment_id, &root)
-		: cluster_semantic_activation_resolve_shared_undo_root_live_owner_source(
-			  admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED, owner,
-			  expected_owner->segment_id, &root);
-
-	step = target_side
-		? cluster_undo_block0_current_acquire_begin_live_owner_target(
-			  &key, cluster_ges_request_timeout_ms, admission, &guard,
-			  &current_failure)
-		: cluster_undo_block0_current_acquire_begin_live_owner_source(
-			  &key, cluster_ges_request_timeout_ms, admission, &guard,
-			  &current_failure);
-	if (step == CLUSTER_UNDO_BLOCK0_CURRENT_FAILED)
-		ereport(ERROR,
-				(errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
-				 errmsg("canonical ACTIVE block-zero current authority is unavailable"),
-				 errdetail("segment=%u result=%d", expected_owner->segment_id,
-						   (int)current_failure)));
-	current_active = true;
+	ctrc_reserve_perpetual = cluster_ges_request_timeout_ms == -1;
+	if (!ctrc_reserve_perpetual)
+		ctrc_reserve_deadline = TimestampTzPlusMilliseconds(
+			GetCurrentTimestamp(), cluster_ges_request_timeout_ms);
 
 	PG_TRY();
 	{
+	retry_active_snapshot:
+		MemSet(&root, 0, sizeof(root));
+		MemSet(&generation, 0, sizeof(generation));
+		root_available = target_side
+			? cluster_semantic_activation_resolve_shared_undo_root(
+				  admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED, owner,
+				  expected_owner->segment_id, &root)
+			: cluster_semantic_activation_resolve_shared_undo_root_live_owner_source(
+				  admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED, owner,
+				  expected_owner->segment_id, &root);
+
+		step = target_side
+			? cluster_undo_block0_current_acquire_begin_live_owner_target(
+				  &key, cluster_ges_request_timeout_ms, admission, &guard,
+				  &current_failure)
+			: cluster_undo_block0_current_acquire_begin_live_owner_source(
+				  &key, cluster_ges_request_timeout_ms, admission, &guard,
+				  &current_failure);
+		if (step == CLUSTER_UNDO_BLOCK0_CURRENT_FAILED)
+		{
+			ges_failure = cluster_ges_timeout_detail_get();
+			ereport(ERROR,
+					(errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
+					 errmsg("canonical ACTIVE block-zero current authority is unavailable"),
+					 errdetail("segment=%u result=%d source=%s master=%d attempts=%d",
+							   expected_owner->segment_id, (int)current_failure,
+							   cluster_ges_timeout_src_text(ges_failure->source),
+							   ges_failure->master_node, ges_failure->attempts)));
+		}
+		current_active = true;
+
 		while (step == CLUSTER_UNDO_BLOCK0_CURRENT_PENDING) {
 			CHECK_FOR_INTERRUPTS();
 			step = cluster_undo_block0_current_acquire_poll(&guard,
@@ -374,9 +393,20 @@ cluster_tt_slot_durable_publish_active(
 				pg_usleep(1000L);
 		}
 		if (step != CLUSTER_UNDO_BLOCK0_CURRENT_HELD || !root_available)
+		{
+			ges_failure = cluster_ges_timeout_detail_get();
 			ereport(ERROR,
 					(errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
-					 errmsg("canonical ACTIVE shared block-zero root is unavailable")));
+					 errmsg("canonical ACTIVE shared block-zero root is unavailable"),
+					 errdetail("segment=%u side=%s root_available=%s step=%d result=%d "
+							   "source=%s master=%d attempts=%d",
+							   expected_owner->segment_id,
+							   target_side ? "target" : "source",
+							   root_available ? "true" : "false",
+							   (int) step, (int) current_failure,
+							   cluster_ges_timeout_src_text(ges_failure->source),
+							   ges_failure->master_node, ges_failure->attempts)));
+		}
 
 		result = cluster_undo_block0_current_sample_generation_exclusive(
 			&guard, &root, &generation);
@@ -446,12 +476,23 @@ cluster_tt_slot_durable_publish_active(
 		if (publication_epoch > UINT32_MAX
 			|| publication_boot_incarnation == 0
 			|| admission->record_generation == 0
-			|| admission->formation_epoch == 0
 			|| root.root_id == 0 || root.root_generation == 0
 			|| GetSystemIdentifier() == 0)
 			ereport(ERROR,
 					(errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
-					 errmsg("canonical ACTIVE CTRC identity is unavailable")));
+					 errmsg("canonical ACTIVE CTRC identity is unavailable"),
+					 errdetail("epoch=%llu boot_incarnation=%llu "
+							   "record_generation=%llu formation_epoch=%llu "
+							   "root_id=%llu root_generation=%llu "
+							   "system_identifier=%llu",
+							   (unsigned long long)publication_epoch,
+							   (unsigned long long)publication_boot_incarnation,
+							   (unsigned long long)admission->record_generation,
+							   (unsigned long long)admission->formation_epoch,
+							   (unsigned long long)root.root_id,
+							   (unsigned long long)root.root_generation,
+							   (unsigned long long)GetSystemIdentifier())));
+		MemSet(&ctrc_key, 0, sizeof(ctrc_key));
 		ctrc_key.format_version = CLUSTER_CTRC_FORMAT_VERSION;
 		ctrc_key.owner_instance = owner;
 		ctrc_key.origin_node_id = (uint16)cluster_node_id;
@@ -470,10 +511,75 @@ cluster_tt_slot_durable_publish_active(
 		ctrc_key.root_generation = root.root_generation;
 		ctrc_reserve_result = cluster_ctrc_origin_reserve_active(
 			&ctrc_key, &ctrc_reservation);
+		if (ctrc_reserve_result
+			== CLUSTER_CTRC_ORIGIN_RESERVE_RETRY_RELEASED)
+		{
+			/* The old row needs cleaner progress before it can be reclaimed.
+			 * Never retain block-0 current or its content pin across that
+			 * asynchronous wait: the cleaner can require the same authority
+			 * before it reaches certificate notification.  The next attempt
+			 * reacquires and rebuilds the complete canonical snapshot. */
+			if (pin_held)
+			{
+				cluster_undo_block0_unpin(&pin);
+				pin_held = false;
+			}
+			if (current_active)
+			{
+				cluster_undo_block0_current_cancel(&guard);
+					current_active = false;
+					MemSet(&guard, 0, sizeof(guard));
+				}
+			/* Terminal publication already woke the first cleaner pass.  Re-arm
+			 * explicitly for an overlap observed between passes, then poll only
+			 * the CTRC row.  Reacquiring block-0 XCUR while the released row is
+			 * unchanged creates no new evidence and can starve the cleaner/GES
+			 * path that must deliver the notification. */
+			cluster_undo_cleaner_wakeup();
+			while (cluster_ctrc_origin_release_overlap_pending(&ctrc_key))
+			{
+				if (!ctrc_reserve_perpetual
+					&& GetCurrentTimestamp() >= ctrc_reserve_deadline)
+					break;
+				CHECK_FOR_INTERRUPTS();
+				pg_usleep(1000L);
+			}
+			if (ctrc_reserve_perpetual
+				|| GetCurrentTimestamp() < ctrc_reserve_deadline)
+			{
+				CHECK_FOR_INTERRUPTS();
+				goto retry_active_snapshot;
+			}
+		}
 		if (ctrc_reserve_result == CLUSTER_CTRC_ORIGIN_RESERVE_REFUSED)
 			ereport(ERROR,
 					(errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
-					 errmsg("canonical ACTIVE CTRC origin reservation is unavailable")));
+					 errmsg("canonical ACTIVE CTRC origin reservation is unavailable"),
+					 errdetail("ready=%s owner=%u origin=%u segment=%u "
+							   "generation=%u slot=%u wrap=%u xid=%u",
+							   cluster_ctrc_shmem_ready() ? "true" : "false",
+							   ctrc_key.owner_instance,
+							   ctrc_key.origin_node_id,
+							   ctrc_key.segment_id,
+							   ctrc_key.segment_generation,
+							   ctrc_key.slot_offset,
+							   ctrc_key.slot_wrap,
+							   ctrc_key.xid)));
+		if (ctrc_reserve_result
+			== CLUSTER_CTRC_ORIGIN_RESERVE_RETRY_RELEASED)
+			ereport(ERROR,
+					(errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
+					 errmsg("canonical ACTIVE CTRC origin release notification timed out"),
+					 errdetail("owner=%u origin=%u segment=%u generation=%u "
+							   "slot=%u wrap=%u xid=%u timeout_ms=%d",
+							   ctrc_key.owner_instance,
+							   ctrc_key.origin_node_id,
+							   ctrc_key.segment_id,
+							   ctrc_key.segment_generation,
+							   ctrc_key.slot_offset,
+							   ctrc_key.slot_wrap,
+							   ctrc_key.xid,
+							   cluster_ges_request_timeout_ms)));
 		ctrc_pre_bind_cancel_armed
 			= ctrc_reserve_result == CLUSTER_CTRC_ORIGIN_RESERVED_PENDING;
 
@@ -683,6 +789,127 @@ cluster_tt_durable_abort_preflight_exact(uint8 instance, uint32 segment_id,
 		segment_generation, xid, wrap, TT_SLOT_ABORTED, InvalidScn);
 }
 
+ClusterUndoTtCtrcReleaseRedoDecision
+cluster_tt_durable_ctrc_release_preflight_exact(
+	const xl_undo_tt_slot_ctrc_release_v1 *record)
+{
+	PGAlignedBlock first;
+	PGAlignedBlock second;
+	const UndoSegmentHeaderData *first_header
+		= (const UndoSegmentHeaderData *)first.data;
+	const UndoSegmentHeaderData *second_header
+		= (const UndoSegmentHeaderData *)second.data;
+	ClusterUndoPathIntent intent;
+
+	if (!cluster_undo_tt_ctrc_release_valid(record)
+		|| record->owner_instance
+		   != tt_owner_instance_for_segment(record->segment_id))
+		return CLUSTER_UNDO_TT_CTRC_RELEASE_REDO_CONFLICT;
+	intent = cluster_undo_intent_for_owner(record->owner_instance);
+	cluster_tt_durable_io_wait_start();
+	if (!cluster_undo_smgr_read_block(intent, record->segment_id,
+			record->owner_instance, 0, first.data)
+		|| !cluster_undo_smgr_read_block(intent, record->segment_id,
+			record->owner_instance, 0, second.data))
+	{
+		cluster_tt_durable_io_wait_end();
+		return CLUSTER_UNDO_TT_CTRC_RELEASE_REDO_CONFLICT;
+	}
+	cluster_tt_durable_io_wait_end();
+	if (first_header->segment_id != record->segment_id
+		|| first_header->owner_instance != record->owner_instance
+		|| first_header->tt_slots_count != TT_SLOTS_PER_SEGMENT
+		|| second_header->segment_id != first_header->segment_id
+		|| second_header->owner_instance != first_header->owner_instance
+		|| second_header->tt_slots_count != first_header->tt_slots_count
+		|| second_header->wrap_count != first_header->wrap_count
+		|| memcmp(&second_header->tt_slots[record->slot_offset],
+			&first_header->tt_slots[record->slot_offset], sizeof(TTSlot)) != 0)
+		return CLUSTER_UNDO_TT_CTRC_RELEASE_REDO_CONFLICT;
+	return cluster_undo_tt_ctrc_release_redo_decide(
+		first_header->wrap_count,
+		&first_header->tt_slots[record->slot_offset], record);
+}
+
+void
+cluster_tt_durable_redo_ctrc_release_slot_exact(
+	const xl_undo_tt_slot_ctrc_release_v1 *record)
+{
+	ClusterUndoPathIntent intent;
+	PGAlignedBlock block;
+	UndoSegmentHeaderData *header = (UndoSegmentHeaderData *)block.data;
+	ClusterUndoTtCtrcReleaseRedoDecision decision;
+	TTSlot *slot;
+
+	if (!cluster_undo_tt_ctrc_release_valid(record)
+		|| record->owner_instance
+		   != tt_owner_instance_for_segment(record->segment_id))
+		ereport(PANIC,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("invalid exact TT CTRC release identity")));
+	intent = cluster_undo_intent_for_owner(record->owner_instance);
+	cluster_tt_durable_io_wait_start();
+	if (!cluster_undo_smgr_read_block(intent, record->segment_id,
+			record->owner_instance, 0, block.data))
+	{
+		cluster_tt_durable_io_wait_end();
+		ereport(PANIC,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("cannot read undo segment %u for CTRC release redo",
+					record->segment_id)));
+	}
+	if (header->segment_id != record->segment_id
+		|| header->owner_instance != record->owner_instance
+		|| header->tt_slots_count != TT_SLOTS_PER_SEGMENT)
+	{
+		cluster_tt_durable_io_wait_end();
+		ereport(PANIC,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("conflicting undo segment header for CTRC release redo")));
+	}
+	slot = &header->tt_slots[record->slot_offset];
+	decision = cluster_undo_tt_ctrc_release_redo_decide(
+		header->wrap_count, slot, record);
+	if (decision == CLUSTER_UNDO_TT_CTRC_RELEASE_REDO_SKIP_STALE)
+	{
+		cluster_tt_durable_io_wait_end();
+		cluster_vis_bump_recovery_undo_redo_skips();
+		return;
+	}
+	if (decision == CLUSTER_UNDO_TT_CTRC_RELEASE_REDO_IDEMPOTENT)
+	{
+		cluster_tt_durable_io_wait_end();
+		return;
+	}
+	if (decision != CLUSTER_UNDO_TT_CTRC_RELEASE_REDO_APPLY)
+	{
+		cluster_tt_durable_io_wait_end();
+		ereport(PANIC,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("conflicting terminal predecessor for CTRC release redo"),
+				 errdetail("segment_generation=%u disk_generation=%u slot=%u wrap=%u xid=%u",
+					record->segment_generation, header->wrap_count,
+					record->slot_offset, record->slot_wrap, record->xid)));
+	}
+	slot->flags = TT_SLOT_FLAG_CTRC_RELEASE_PROVEN;
+	if (!cluster_undo_smgr_write_header_bytes(intent, record->segment_id,
+			record->owner_instance,
+			(uint32)offsetof(UndoSegmentHeaderData, tt_slots)
+				+ (uint32)record->slot_offset * (uint32)sizeof(TTSlot),
+			(const char *)slot, sizeof(*slot))
+		|| !cluster_undo_smgr_fsync_segment_file(record->segment_id,
+			record->owner_instance))
+	{
+		cluster_tt_durable_io_wait_end();
+		ereport(PANIC,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("cannot durably write CTRC release bit for undo segment %u slot %u",
+					record->segment_id, record->slot_offset)));
+	}
+	cluster_tt_durable_io_wait_end();
+	cluster_vis_bump_recovery_undo_redo_applies();
+}
+
 bool
 cluster_tt_durable_slot_match(uint8 slot_status, TransactionId slot_xid, uint16 slot_wrap,
 							  SCN slot_commit_scn, TransactionId want_xid, uint32 expected_wrap)
@@ -778,6 +1005,7 @@ tt_slot_write_committed(uint32 segment_id, uint8 owner, uint16 slot_offset, Tran
 	slot.xid = xid;
 	slot.wrap = wrap;
 	slot.status = (uint8)TT_SLOT_COMMITTED;
+	slot.flags = TT_FLAGS_RESERVED;
 	slot.commit_scn = commit_scn;
 	slot.first_undo_block = InvalidUbaVal; /* spec-4.8 D7-A (P1#1): no stale head */
 
@@ -982,6 +1210,7 @@ tt_slot_durable_terminal_exact(uint32 segment_id, uint32 segment_generation,
 					 errmsg("canonical TT commit predecessor is not exact")));
 		successor = disk_header->tt_slots[slot_offset];
 		successor.status = terminal_status;
+		successor.flags = TT_FLAGS_RESERVED;
 		successor.commit_scn = terminal_scn;
 		successor.first_undo_block = InvalidUbaVal;
 		final_expected = apply_transition ? successor
@@ -1135,6 +1364,7 @@ cluster_tt_slot_durable_abort(uint32 segment_id, uint16 slot_offset, Transaction
 	slot.xid = xid;
 	slot.wrap = wrap;
 	slot.status = (uint8)TT_SLOT_ABORTED;
+	slot.flags = TT_FLAGS_RESERVED;
 	slot.commit_scn = InvalidScn;
 	slot.first_undo_block = InvalidUbaVal; /* spec-4.8 D7-A (P1#1): cleared; 0x90 re-attaches */
 
@@ -1400,6 +1630,7 @@ cluster_tt_durable_redo_abort_slot(uint8 instance, uint32 segment_id,
 	slot.xid = xid;
 	slot.wrap = wrap;
 	slot.status = TT_SLOT_ABORTED;
+	slot.flags = TT_FLAGS_RESERVED;
 	slot.commit_scn = InvalidScn;
 	slot.first_undo_block = InvalidUbaVal;
 	if (!cluster_undo_smgr_write_header_bytes(
@@ -1473,6 +1704,7 @@ cluster_tt_durable_redo_abort_slot_exact(uint8 instance, uint32 segment_id,
 	}
 	successor = header->tt_slots[slot_offset];
 	successor.status = TT_SLOT_ABORTED;
+	successor.flags = TT_FLAGS_RESERVED;
 	successor.commit_scn = InvalidScn;
 	successor.first_undo_block = InvalidUbaVal;
 	if (!cluster_undo_smgr_write_header_bytes(

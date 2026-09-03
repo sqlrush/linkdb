@@ -28,6 +28,7 @@
 #include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_tx_enqueue.h"
 #include "cluster/cluster_tx_resolve.h"
+#include "cluster/cluster_undo_record_api.h"
 #include "cluster/cluster_uba.h"
 #include "cluster/cluster_visibility_resolve.h"
 #include "cluster/cluster_xid_stripe.h"
@@ -110,7 +111,8 @@ HeapTupleHeaderGetCmax(HeapTupleHeader tup pg_attribute_unused())
 ClusterTxwResult
 cluster_tx_enqueue_wait_current_mx(
 	const ClusterTTStatusKey *holder_key pg_attribute_unused(),
-	int effective_timeout_ms pg_attribute_unused())
+	int effective_timeout_ms pg_attribute_unused(),
+	uint64 *absolute_deadline_mono_us pg_attribute_unused())
 {
 	UT_ASSERT(false);
 	return CLUSTER_TXW_UNPROVABLE;
@@ -647,7 +649,7 @@ cluster_tx_locator_from_itl(Page page, uint8 slot_index,
 	memset(out, 0, sizeof(*out));
 	out->uba = slot->undo_segment_head;
 	out->xid = slot->xid;
-	out->tt_wrap = TT_WRAP_INVALID;
+	out->tt_wrap = slot->wrap;
 	out->itl_kind = slot->flags;
 	out->itl_slot_index = slot_index;
 	*reason_out = CLUSTER_TX_RESOLVE_NONE;
@@ -659,7 +661,33 @@ cluster_tx_locator_from_itl_terminal_census(
 	Page page, uint8 slot_index, ClusterTxLocator *out,
 	ClusterTxResolveReason *reason_out)
 {
-	return cluster_tx_locator_from_itl(page, slot_index, out, reason_out);
+	if (!cluster_tx_locator_from_itl(page, slot_index, out, reason_out))
+		return false;
+	out->tt_wrap = TT_WRAP_INVALID;
+	return true;
+}
+
+bool
+cluster_multixact_current_successor_provenance_well_formed(
+	const ClusterCurrentMxSuccessorAlias *alias,
+	const ClusterTxLocator *locator, TransactionId updater_xid,
+	uint16 updater_origin_node, uint32 current_epoch)
+{
+	uint32 segment_id;
+	uint32 block_no;
+	uint16 slot_offset;
+	uint16 row_offset;
+
+	return alias != NULL && locator != NULL
+		&& uba_decode(locator->uba, &segment_id, &block_no, &slot_offset,
+					  &row_offset)
+		&& alias->origin_node_id == updater_origin_node
+		&& alias->undo_record_segment_id == segment_id
+		&& alias->tt_slot_id == (uint32)slot_offset + 1
+		&& alias->cluster_epoch == current_epoch
+		&& alias->local_xid == updater_xid
+		&& locator->xid == updater_xid
+		&& locator->tt_wrap != TT_WRAP_INVALID;
 }
 
 ClusterTxOutcome
@@ -972,15 +1000,15 @@ cluster_multixact_current_members_resolve(const ClusterCurrentMxKey *key,
 	}
 	UT_ASSERT_EQ(challenge->updater_xid, UT_HOT_AUTH_UPDATER);
 	UT_ASSERT_EQ(challenge->member_ordinal, updater_ordinal);
-	UT_ASSERT_EQ(challenge->candidate_next_xmin_key.origin_node_id,
+	UT_ASSERT_EQ(challenge->candidate_next_xmin_alias.origin_node_id,
 				 UT_HOT_CURRENT_MX_ORIGIN);
-	UT_ASSERT_EQ(challenge->candidate_next_xmin_key.undo_segment_id,
+	UT_ASSERT_EQ(challenge->candidate_next_xmin_alias.undo_record_segment_id,
 				 ut_hot_successor_ref.undo_segment_id);
-	UT_ASSERT_EQ(challenge->candidate_next_xmin_key.tt_slot_id,
+	UT_ASSERT_EQ(challenge->candidate_next_xmin_alias.tt_slot_id,
 				 ut_hot_successor_ref.tt_slot_id);
-	UT_ASSERT_EQ(challenge->candidate_next_xmin_key.cluster_epoch,
+	UT_ASSERT_EQ(challenge->candidate_next_xmin_alias.cluster_epoch,
 				 UT_HOT_CURRENT_EPOCH);
-	UT_ASSERT_EQ(challenge->candidate_next_xmin_key.local_xid,
+	UT_ASSERT_EQ(challenge->candidate_next_xmin_alias.local_xid,
 				 UT_HOT_AUTH_UPDATER);
 	ut_hot_current_mx_resolve_calls++;
 	UT_ASSERT_NOT_NULL(proof_capability_generations);
@@ -997,7 +1025,10 @@ cluster_multixact_current_members_resolve(const ClusterCurrentMxKey *key,
 	}
 	memset(updater_proof, 0, sizeof(*updater_proof));
 	updater_proof->mxkey = *key;
-	updater_proof->candidate_next_xmin_key = challenge->candidate_next_xmin_key;
+	updater_proof->candidate_next_xmin_alias
+		= challenge->candidate_next_xmin_alias;
+	updater_proof->candidate_next_xmin_locator
+		= challenge->candidate_next_xmin_locator;
 	updater_proof->updater_xid = challenge->updater_xid;
 	updater_proof->member_ordinal = challenge->member_ordinal;
 	updater_proof->verdict = CUCP_MATCH;
@@ -1023,9 +1054,12 @@ cluster_multixact_current_validate_updater_proof(
 	UT_ASSERT_EQ(challenge->member_ordinal, updater_ordinal);
 	UT_ASSERT_EQ(updater_proof->verdict, CUCP_MATCH);
 	UT_ASSERT(memcmp(key, &updater_proof->mxkey, sizeof(*key)) == 0);
-	UT_ASSERT(memcmp(&challenge->candidate_next_xmin_key,
-				 &updater_proof->candidate_next_xmin_key,
-				 sizeof(ClusterTTStatusKey)) == 0);
+	UT_ASSERT(memcmp(&challenge->candidate_next_xmin_alias,
+				 &updater_proof->candidate_next_xmin_alias,
+				 sizeof(ClusterCurrentMxSuccessorAlias)) == 0);
+	UT_ASSERT(memcmp(&challenge->candidate_next_xmin_locator,
+				 &updater_proof->candidate_next_xmin_locator,
+				 sizeof(ClusterTxLocator)) == 0);
 	ut_hot_current_mx_validate_calls++;
 	return true;
 }
@@ -1055,6 +1089,32 @@ cluster_multixact_current_decide(
 	UT_ASSERT_NOT_NULL(updater_proof);
 	UT_ASSERT_NOT_NULL(wait_key);
 	return CMDL_CONTINUE;
+}
+
+ClusterCurrentMxDecision
+cluster_multixact_current_decide_observed(
+	const ClusterCurrentMxMemberDesc *members,
+	const ClusterCurrentMemberProof *proofs, uint16 nmembers,
+	const ClusterCurrentMxRequestContext *ctx,
+	const ClusterCurrentUpdaterChallenge *challenge,
+	const ClusterCurrentUpdaterProof *updater_proof,
+	ClusterTTStatusKey *wait_key, ClusterCurrentMxDecisionTrace *trace)
+{
+	if (trace != NULL) {
+		trace->unknown_reason = CMX_UNKNOWN_NONE;
+		trace->member_ordinal = -1;
+	}
+	return cluster_multixact_current_decide(members, proofs, nmembers, ctx,
+		challenge, updater_proof, wait_key);
+}
+
+ClusterUndoRecordConsumePreflightResult
+cluster_undo_record_consume_preflight(ClusterUndoRecordPrepareReceipt *receipt,
+									 uint16 payload_len)
+{
+	(void) receipt;
+	(void) payload_len;
+	return CLUSTER_UNDO_RECORD_CONSUME_PREFLIGHT_READY;
 }
 
 ClusterMxRecomposeResult
@@ -1656,6 +1716,7 @@ ut_r4_hot_build_foreign_multixact_chain(char storage[BLCKSZ])
 	slot->xid = UT_HOT_AUTH_UPDATER;
 	slot->wrap = 8;
 	slot->flags = ITL_FLAG_ACTIVE;
+	slot->undo_segment_head = uba_encode(258, 2, 7, 0);
 }
 
 static void
@@ -2365,7 +2426,6 @@ UT_TEST(test_39_peer_foreign_multixact_hot_chain_never_uses_native_decode)
 	ut_hot_current_mx_describe_calls = 0;
 	ut_hot_current_mx_resolve_calls = 0;
 	ut_hot_current_mx_validate_calls = 0;
-
 	memset(&relation, 0, sizeof(relation));
 	memset(&relation_form, 0, sizeof(relation_form));
 	relation.rd_id = UT_HOT_TABLE_OID;
@@ -3157,7 +3217,14 @@ static void
 ut_dml_guard_advance_hint_lsn(Buffer buffer, HeapTuple tuple pg_attribute_unused(),
 							 void *arg)
 {
+	int saved_node_id = cluster_node_id;
+
+	/* A shipped page can carry another node's WAL origin.  The terminal
+	 * census hint FPI legitimately advances both pd_lsn and its origin to
+	 * this writer's stream. */
+	cluster_node_id = saved_node_id == 3 ? 2 : 3;
 	PageSetLSN(BufferGetPage(buffer), *(XLogRecPtr *) arg);
+	cluster_node_id = saved_node_id;
 }
 
 static void
@@ -3206,9 +3273,18 @@ UT_TEST(test_64_dml_guard_allows_terminal_hint_lsn_but_rejects_authority_drift)
 		PageGetItemId((Page) fixture.live_page, UT_HOT_ROOT_OFF));
 	ItemPointerSet(&tuple.t_self, UT_HOT_BLOCK, UT_HOT_ROOT_OFF);
 
-	/* A terminal-census hint FPI may advance only the page LSN. */
+	/* A terminal-census hint FPI may advance the page LSN and its coupled
+	 * origin qualifier; neither is DML authority. */
 	UT_ASSERT(cluster_heap_test_dml_authority_guard_recheck_with_hook(
 		UT_HOT_BUFFER, &tuple, ut_dml_guard_advance_hint_lsn, &hint_lsn));
+
+	/* The grant-to-content writer token rotates on a legal unlock/relock.  It
+	 * is diagnostic projection, not Resource-X/PCM identity. */
+	ut_hot_pcm_snapshot_calls = 0;
+	ut_itl_census_change_writer_activation_projection = true;
+	UT_ASSERT(cluster_heap_test_dml_authority_guard_recheck_with_hook(
+		UT_HOT_BUFFER, &tuple, NULL, NULL));
+	ut_itl_census_change_writer_activation_projection = false;
 
 	/* Exact PCM and target-tuple drift remain fail closed. */
 	ut_hot_pcm_snapshot_calls = 0;
@@ -3283,14 +3359,88 @@ UT_TEST(test_71_all_heap_callers_refuse_partial_apply_without_retry_edge)
 	}
 }
 
+/* A successful publication crosses one caller-owned boundary.  Every exact
+ * target is rechecked before the first receipt is applied, and undo is
+ * consumed only after the final receipt has become APPLIED. */
+UT_TEST(test_76_all_heap_callers_preflight_apply_then_consume)
+{
+	static const uint8 expected_undo_plans[] = {1, 1, 2, 0, 1, 1};
+	static const uint8 expected_mx_publications[] = {0, 1, 2, 1, 1, 0};
+	ClusterHeapNoRetryTestCaller caller;
+
+	for (caller = CLUSTER_HEAP_NO_RETRY_TEST_INSERT;
+		 caller <= CLUSTER_HEAP_NO_RETRY_TEST_UPDATE_CHAIN; caller++)
+	{
+		ClusterHeapNoRetryTestReport report;
+		uint8 expected_total = expected_undo_plans[caller]
+			+ expected_mx_publications[caller];
+
+		UT_ASSERT(cluster_heap_test_no_retry_boundary(
+			caller, false, false, &report));
+		UT_ASSERT_EQ(report.outcome, CLUSTER_HEAP_NO_RETRY_TEST_APPLIED);
+		UT_ASSERT_EQ(report.preflight_calls, expected_total);
+		UT_ASSERT_EQ(report.apply_calls, expected_total);
+		UT_ASSERT_EQ(report.consume_calls,
+			expected_undo_plans[caller] == 0 ? 0 : 1);
+		UT_ASSERT_EQ(report.retained_undo_handle_count,
+			expected_undo_plans[caller]);
+		UT_ASSERT(report.last_preflight_event > 0);
+		UT_ASSERT(report.first_apply_event > report.last_preflight_event);
+		if (report.consume_calls != 0)
+			UT_ASSERT(report.consume_event > report.last_apply_event);
+		UT_ASSERT(!report.retry_edge);
+	}
+}
+
+/* The outer prepare loop freezes one absolute deadline.  Transient misses
+ * retry with that exact value; READY succeeds and REFUSED terminates without
+ * manufacturing a new deadline or another attempt. */
+UT_TEST(test_77_heap_prepare_retries_with_one_frozen_deadline)
+{
+	const ClusterUndoRecordPrepareResult results[] = {
+		CLUSTER_UNDO_RECORD_PREPARE_RETRY_REQUIRED,
+		CLUSTER_UNDO_RECORD_PREPARE_RETRY_REQUIRED,
+		CLUSTER_UNDO_RECORD_PREPARE_READY,
+	};
+	ClusterHeapPrepareRetryTestReport report;
+
+	UT_ASSERT(cluster_heap_test_prepare_retry_sequence(results,
+		lengthof(results), UINT64_C(987654321), &report));
+	UT_ASSERT_EQ(report.prepare_calls, 3);
+	UT_ASSERT(report.deadline_stable);
+	UT_ASSERT_EQ(report.observed_deadline_us, UINT64_C(987654321));
+	UT_ASSERT_EQ(report.terminal_result, CLUSTER_UNDO_RECORD_PREPARE_READY);
+}
+
+UT_TEST(test_78_heap_prepare_refusal_stops_without_extra_attempt)
+{
+	const ClusterUndoRecordPrepareResult results[] = {
+		CLUSTER_UNDO_RECORD_PREPARE_RETRY_REQUIRED,
+		CLUSTER_UNDO_RECORD_PREPARE_REFUSED,
+		CLUSTER_UNDO_RECORD_PREPARE_READY,
+	};
+	ClusterHeapPrepareRetryTestReport report;
+
+	UT_ASSERT(!cluster_heap_test_prepare_retry_sequence(results,
+		lengthof(results), UINT64_C(123456789), &report));
+	UT_ASSERT_EQ(report.prepare_calls, 2);
+	UT_ASSERT(report.deadline_stable);
+	UT_ASSERT_EQ(report.observed_deadline_us, UINT64_C(123456789));
+	UT_ASSERT_EQ(report.terminal_result, CLUSTER_UNDO_RECORD_PREPARE_REFUSED);
+}
+
 UT_TEST(test_72_itl_reference_admission_requires_current_receipt_identity)
 {
 	UT_ASSERT(cluster_heap_test_itl_receipt_identity_admitted(
 		FirstNormalTransactionId, 1));
+	UT_ASSERT(cluster_heap_test_itl_receipt_identity_admitted(
+		FirstNormalTransactionId, UINT16_MAX));
 	UT_ASSERT(!cluster_heap_test_itl_receipt_identity_admitted(
 		InvalidTransactionId, 1));
 	UT_ASSERT(!cluster_heap_test_itl_receipt_identity_admitted(
 		FirstNormalTransactionId, 0));
+	UT_ASSERT(!cluster_heap_test_itl_receipt_identity_admitted(
+		FirstNormalTransactionId, ((uint32) UINT16_MAX) + 1));
 }
 
 UT_TEST(test_73_current_multi_insert_delegates_to_receipt_safe_heap_insert)
@@ -3311,6 +3461,24 @@ UT_TEST(test_75_update_predicts_successor_only_for_receipt_consumers)
 		false, true));
 	UT_ASSERT(cluster_heap_test_update_needs_successor_prediction(
 		true, true));
+}
+
+/* A local catalog page has no PCM generation and therefore cannot produce a
+ * current CTRC receipt.  The heap gate must follow the same relation-class
+ * boundary as shared SMGR/PCM, while shared catalogs and user relations keep
+ * the cluster path. */
+UT_TEST(test_80_itl_route_matches_shared_relation_boundary)
+{
+	UT_ASSERT(!cluster_heap_test_itl_relation_route(
+		false, false, false, (RelFileNumber) FirstNormalObjectId));
+	UT_ASSERT(!cluster_heap_test_itl_relation_route(
+		true, true, true, (RelFileNumber) FirstNormalObjectId));
+	UT_ASSERT(!cluster_heap_test_itl_relation_route(
+		true, false, false, (RelFileNumber) (FirstNormalObjectId - 1)));
+	UT_ASSERT(cluster_heap_test_itl_relation_route(
+		true, false, true, (RelFileNumber) (FirstNormalObjectId - 1)));
+	UT_ASSERT(cluster_heap_test_itl_relation_route(
+		true, false, false, (RelFileNumber) FirstNormalObjectId));
 }
 
 UT_TEST(test_65_batch_cleanout_routes_every_retained_scn_to_exact_c1b_pair)
@@ -3489,6 +3657,10 @@ UT_TEST(test_68_one_member_current_mx_reaches_ordinary_heap_consumer)
 	ut_hot_current_mx_active = true;
 	ut_hot_current_mx_member_count = 1;
 	ut_current_mx_ordinary_lock_only = true;
+	/* Releasing content authority for DESCRIBE/RESOLVE may rotate only the
+	 * diagnostic writer-activation projection.  It is not PCM identity and
+	 * must not manufacture an ABA restart. */
+	ut_itl_census_change_writer_activation_projection = true;
 	ut_hot_pcm_snapshot_calls = 0;
 	ut_hot_current_mx_describe_calls = 0;
 	ut_hot_current_mx_resolve_calls = 0;
@@ -3518,10 +3690,12 @@ UT_TEST(test_68_one_member_current_mx_reaches_ordinary_heap_consumer)
 	UT_ASSERT_EQ(normalized[1].status, MultiXactStatusForKeyShare);
 	UT_ASSERT_EQ(ut_hot_current_mx_describe_calls, 1);
 	UT_ASSERT_EQ(ut_hot_current_mx_resolve_calls, 1);
+	UT_ASSERT_EQ(ut_hot_pcm_snapshot_calls, 3);
 	UT_ASSERT_EQ(ut_native_multixact_decode_calls, 0);
 
 	LockBuffer(UT_HOT_BUFFER, BUFFER_LOCK_UNLOCK);
 	ut_current_mx_ordinary_lock_only = false;
+	ut_itl_census_change_writer_activation_projection = false;
 	ut_hot_current_mx_member_count = 2;
 	ut_hot_current_mx_active = false;
 	ut_hot_production_core_active = false;
@@ -3530,10 +3704,25 @@ UT_TEST(test_68_one_member_current_mx_reaches_ordinary_heap_consumer)
 	BufferBlocks = NULL;
 }
 
+UT_TEST(test_79_current_mx_epoch_zero_requires_clean_four_node_formation)
+{
+	memset(&ut_cluster_conf, 0, sizeof(ut_cluster_conf));
+	ut_cluster_conf.node_count = 4;
+	UT_ASSERT(cluster_heap_test_current_mx_epoch_supported(0));
+	UT_ASSERT(cluster_heap_test_current_mx_epoch_supported(1));
+	UT_ASSERT(cluster_heap_test_current_mx_epoch_supported(UINT32_MAX));
+	UT_ASSERT(!cluster_heap_test_current_mx_epoch_supported(
+		UINT64_C(1) + UINT32_MAX));
+
+	ut_cluster_conf.node_count = 2;
+	UT_ASSERT(!cluster_heap_test_current_mx_epoch_supported(0));
+	UT_ASSERT(cluster_heap_test_current_mx_epoch_supported(1));
+}
+
 int
 main(void)
 {
-	UT_PLAN(74);
+	UT_PLAN(79);
 	UT_RUN(test_01_held_lock_bits_are_independent);
 	UT_RUN(test_02_wait_edge_values_are_closed);
 	UT_RUN(test_03_utility_to_lmon_wait_with_no_lock_is_allowed);
@@ -3601,13 +3790,18 @@ main(void)
 	UT_RUN(test_69_dml_guard_rejects_selected_itl_slot_only_aba);
 	UT_RUN(test_70_all_heap_callers_retry_only_from_zero_apply_drift);
 	UT_RUN(test_71_all_heap_callers_refuse_partial_apply_without_retry_edge);
+	UT_RUN(test_76_all_heap_callers_preflight_apply_then_consume);
+	UT_RUN(test_77_heap_prepare_retries_with_one_frozen_deadline);
+	UT_RUN(test_78_heap_prepare_refusal_stops_without_extra_attempt);
 	UT_RUN(test_72_itl_reference_admission_requires_current_receipt_identity);
 	UT_RUN(test_73_current_multi_insert_delegates_to_receipt_safe_heap_insert);
 	UT_RUN(test_75_update_predicts_successor_only_for_receipt_consumers);
+	UT_RUN(test_80_itl_route_matches_shared_relation_boundary);
 	UT_RUN(test_65_batch_cleanout_routes_every_retained_scn_to_exact_c1b_pair);
 	UT_RUN(test_68_one_member_current_mx_reaches_ordinary_heap_consumer);
 	UT_RUN(test_66_one_member_current_mx_reaches_real_hot_companion);
 	UT_RUN(test_67_one_member_current_mx_reaches_standard_hot_consumer);
+	UT_RUN(test_79_current_mx_epoch_zero_requires_clean_four_node_formation);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

@@ -53,6 +53,12 @@ cluster_wal_state_correctness_census_ok(void)
 	return true;
 }
 
+bool
+cluster_ctrc_shmem_ready(void)
+{
+	return true;
+}
+
 uint32
 cluster_grd_recovery_state_value(void)
 {

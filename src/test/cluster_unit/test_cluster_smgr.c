@@ -80,6 +80,10 @@ bool cluster_shared_catalog = false;			   /* spec-6.14 D3 routing flip */
 bool cluster_controlfile_shared_authority = false; /* read by D1 startup vet */
 bool cluster_merged_recovery = false;			   /* read by D1 startup vet (D9 amend dep) */
 
+void
+pg_usleep(long microsec pg_attribute_unused())
+{}
+
 bool
 cluster_shared_fs_block_device_get_storage_uuid(char *out, size_t outlen)
 {

@@ -349,7 +349,14 @@ typedef PageHeaderData *PageHeader;
  * bit; replay restoring a set bit costs one benign extra FPI.
  */
 #define PD_CLUSTER_FORCE_FPI 0x0020
-#define PD_VALID_FLAG_BITS 0x003F /* OR of all valid pd_flags bits */
+/* Spec-8.4D §12.5: pd_lsn belongs to one node-local WAL address space.
+ * Persist that origin in formerly-reserved flag bits so a copied/disk page
+ * carries the qualifier with the LSN without enlarging PageHeaderData. */
+#define PD_LSN_ORIGIN_VALID 0x0040
+#define PD_LSN_ORIGIN_SHIFT 7
+#define PD_LSN_ORIGIN_MASK 0x0780
+#define PGRAC_PAGE_LSN_ORIGIN_MAX 15
+#define PD_VALID_FLAG_BITS 0x07FF /* OR of all valid pd_flags bits */
 #else
 #define PD_VALID_FLAG_BITS 0x0007 /* OR of all valid pd_flags bits */
 #endif
@@ -570,6 +577,49 @@ PageGetLSN(Page page)
 {
 	return PageXLogRecPtrGet(((PageHeader)page)->pd_lsn);
 }
+#ifdef USE_PGRAC_CLUSTER
+static inline void
+PageClearLSNOrigin(Page page)
+{
+	((PageHeader)page)->pd_flags &=
+		(uint16)~(PD_LSN_ORIGIN_VALID | PD_LSN_ORIGIN_MASK);
+}
+
+static inline bool
+PageGetLSNOrigin(Page page, int *origin_out)
+{
+	uint16 flags = ((PageHeader)page)->pd_flags;
+
+	if (origin_out != NULL)
+		*origin_out = -1;
+	if ((flags & PD_LSN_ORIGIN_VALID) == 0)
+		return false;
+	if (origin_out != NULL)
+		*origin_out = (int)((flags & PD_LSN_ORIGIN_MASK)
+			>> PD_LSN_ORIGIN_SHIFT);
+	return true;
+}
+
+static inline bool
+PageSetLSNOrigin(Page page, int origin)
+{
+	PageClearLSNOrigin(page);
+	if (origin < 0 || origin > PGRAC_PAGE_LSN_ORIGIN_MAX)
+		return false;
+	((PageHeader)page)->pd_flags |= (uint16)(PD_LSN_ORIGIN_VALID
+		| ((uint16)origin << PD_LSN_ORIGIN_SHIFT));
+	return true;
+}
+
+/* Immutable remote/storage image installation copies the origin bits with
+ * the page bytes.  Reasserting its already-verified LSN must not relabel that
+ * foreign WAL coordinate as local. */
+static inline void
+PageSetLSNPreserveOrigin(Page page, XLogRecPtr lsn)
+{
+	PageXLogRecPtrSet(((PageHeader)page)->pd_lsn, lsn);
+}
+#endif
 #if defined(USE_PGRAC_CLUSTER) && !defined(FRONTEND)
 /*
  * PGRAC: spec-4.5a §3.3b -- merged-recovery window state, defined in
@@ -583,6 +633,7 @@ extern bool cluster_recmerge_window_active;
 extern uint64 cluster_recmerge_window_scn;
 extern uint64 cluster_recmerge_window_own_lsn;
 extern bool cluster_recmerge_apply_foreign;
+extern int cluster_node_id;
 #endif
 
 static inline void
@@ -602,6 +653,11 @@ PageSetLSN(Page page, XLogRecPtr lsn)
 #endif
 	PageXLogRecPtrSet(((PageHeader)page)->pd_lsn, lsn);
 #if defined(USE_PGRAC_CLUSTER) && !defined(FRONTEND)
+	/* The stored coordinate now belongs to this node's WAL stream.  The
+	 * foreign merged-replay case above first clamps it into this stream. */
+	if (XLogRecPtrIsInvalid(lsn)
+		|| !PageSetLSNOrigin(page, cluster_node_id))
+		PageClearLSNOrigin(page);
 
 	/*
 	 * Inside the merged-replay window every applied record stamps its SCN

@@ -48,6 +48,9 @@
 #include <sys/time.h> /* gettimeofday (full-duration sleep loop) */
 
 #include "cluster/cluster_inject.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_terminal_ref_census.h"
+#endif
 
 
 /* SRF info-V1 declarations -- always linked because pg_proc.dat
@@ -966,6 +969,11 @@ static ClusterInjectPoint cluster_injection_points[] = {
 	 *     S3 storm's dominant "cluster lock acquire timeout" fold hides.
 	 */
 	{ .name = "cluster-ges-master-work-queue-full" },
+
+	/* spec-8.4D MXA-T15 — one shared scheduling-only seam.  The SQL arm
+	 * parameter selects ACTIVE_PROOF_READY / ACK_DURABLE /
+	 * CERTIFICATE_READY; no authority byte is supplied by this registry. */
+	{ .name = "cluster-ctrc-stage-barrier" },
 };
 
 #define CLUSTER_INJECTION_COUNT lengthof(cluster_injection_points)
@@ -1626,6 +1634,24 @@ cluster_inject_fault(PG_FUNCTION_ARGS)
 		}
 	}
 
+	if (strcmp(name, "cluster-ctrc-stage-barrier") == 0)
+	{
+		bool armed = new_type != CLUSTER_FAULT_NONE;
+
+		if (armed && (new_type != CLUSTER_FAULT_SKIP
+						|| param <= CTRC_TEST_BARRIER_NONE
+						|| param >= CTRC_TEST_BARRIER_COUNT))
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("cluster-ctrc-stage-barrier requires fault_type skip and phase 1..3")));
+		if (!cluster_ctrc_test_barrier_control(
+				armed ? (ClusterCtrcTestBarrierPhase)param
+					  : CTRC_TEST_BARRIER_NONE,
+				armed))
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("CTRC shared test barrier is unavailable")));
+	}
 	cluster_injection_arm_internal(p, new_type, param);
 
 	PG_RETURN_BOOL(true);

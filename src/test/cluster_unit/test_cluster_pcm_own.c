@@ -1392,6 +1392,61 @@ UT_TEST(test_pending_x_denied_retry_drops_removed_queue_gap)
 	free(source);
 }
 
+UT_TEST(test_resource_x_s_barrier_aborts_one_racing_reservation_then_parks)
+{
+	char *source = read_bufmgr_source();
+	const char *begin_wait = source != NULL
+		? strstr(source, "\ncluster_bufmgr_pcm_begin_grant_reservation_wait(")
+		: NULL;
+	const char *begin_wait_end = begin_wait != NULL
+		? strstr(begin_wait, "\n}\n\ntypedef enum ClusterBufmgrPcmRetryRearmResult")
+		: NULL;
+	const char *reservation_begin = begin_wait != NULL
+		? strstr(begin_wait, "cluster_pcm_own_begin_grant_reservation(buf")
+		: NULL;
+	const char *resource_x_barrier = reservation_begin != NULL
+		? strstr(reservation_begin,
+			"cluster_gcs_block_resource_x_local_s_barrier_active(buf->tag)")
+		: NULL;
+	const char *abort = resource_x_barrier != NULL
+		? strstr(resource_x_barrier,
+			"cluster_pcm_own_abort_grant_reservation(")
+		: NULL;
+	const char *park = abort != NULL
+		? strstr(abort, "\n\t\t\tdo\n")
+		: NULL;
+	const char *yield = park != NULL
+		? strstr(park, "cluster_bufmgr_resource_x_wait_retry(")
+		: NULL;
+	const char *barrier_recheck = yield != NULL
+		? strstr(yield,
+			"while (cluster_gcs_block_resource_x_local_s_barrier_active(")
+		: NULL;
+
+	/* The header-locked begin must run first so a terminal cached X can cover
+	 * the read.  If a requester-local round raced that begin, abort the one
+	 * exact reversible reservation and remain parked behind the same barrier;
+	 * do not mint one token per retry while T1 is waiting for clean N. */
+	UT_ASSERT_NOT_NULL(begin_wait);
+	UT_ASSERT_NOT_NULL(begin_wait_end);
+	UT_ASSERT_NOT_NULL(reservation_begin);
+	UT_ASSERT_NOT_NULL(resource_x_barrier);
+	UT_ASSERT_NOT_NULL(abort);
+	UT_ASSERT_NOT_NULL(park);
+	UT_ASSERT_NOT_NULL(yield);
+	UT_ASSERT_NOT_NULL(barrier_recheck);
+	if (begin_wait_end != NULL && reservation_begin != NULL
+		&& resource_x_barrier != NULL && abort != NULL && park != NULL
+		&& yield != NULL && barrier_recheck != NULL)
+		UT_ASSERT(reservation_begin < resource_x_barrier
+			&& resource_x_barrier < abort
+			&& abort < park
+			&& park < yield
+			&& yield < barrier_recheck
+			&& barrier_recheck < begin_wait_end);
+	free(source);
+}
+
 UT_TEST(test_bufmgr_finish_rejects_invalid_state_and_initializes_acquire_result)
 {
 	static const char *const finish_gate[]
@@ -3347,7 +3402,7 @@ UT_TEST(test_resource_x_target_writer_context_is_post_t3_and_local_cleanup_only)
 int
 main(void)
 {
-	UT_PLAN(67);
+	UT_PLAN(68);
 	UT_RUN(test_shmem_initializes_complete_entry);
 	UT_RUN(test_resource_x_activation_binding_is_exact_and_legacy_closed);
 	UT_RUN(test_resource_x_reconfig_neutralize_is_generation_exact_and_nonblocking);
@@ -3379,6 +3434,7 @@ main(void)
 	UT_RUN(test_bufmgr_s_base_rollback_normalizes_to_n_under_header_authority);
 	UT_RUN(test_bufmgr_generation_bump_failure_is_classified_under_header_lock);
 	UT_RUN(test_pending_x_denied_retry_drops_removed_queue_gap);
+	UT_RUN(test_resource_x_s_barrier_aborts_one_racing_reservation_then_parks);
 	UT_RUN(test_bufmgr_finish_rejects_invalid_state_and_initializes_acquire_result);
 	UT_RUN(test_bufmgr_finish_and_abort_gate_on_exact_base_state);
 	UT_RUN(test_d5a_release_error_keeps_descriptor_out_of_freelist);

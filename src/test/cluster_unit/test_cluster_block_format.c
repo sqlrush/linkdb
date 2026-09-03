@@ -150,10 +150,32 @@ UT_TEST(test_pd_has_itl_bit_value)
 	 * (PG vanilla used 0x0001-0x0004).  spec-1.22 added
 	 * PD_UNDO_SEG_HEADER = 0x0010, bumping PD_VALID_FLAG_BITS
 	 * 0x000F -> 0x001F; spec-4.5 added PD_CLUSTER_FORCE_FPI = 0x0020
-	 * -> 0x003F.
+	 * -> 0x003F.  Spec-8.4D uses bits 0x0040..0x0400 for the valid bit
+	 * plus four-bit WAL-origin identity, so the closed mask is 0x07FF.
 	 */
 	UT_ASSERT_EQ(PD_HAS_ITL, 0x0008);
-	UT_ASSERT_EQ(PD_VALID_FLAG_BITS, 0x003F);
+	UT_ASSERT_EQ(PD_VALID_FLAG_BITS, 0x07FF);
+}
+
+
+UT_TEST(test_page_lsn_origin_roundtrip_preserves_other_flags)
+{
+	PageHeaderData ph = { 0 };
+	int origin = -1;
+
+	ph.pd_flags = PD_HAS_ITL | PD_CLUSTER_FORCE_FPI;
+	UT_ASSERT(!PageGetLSNOrigin((Page)&ph, &origin));
+	UT_ASSERT_EQ(origin, -1);
+	PageSetLSNOrigin((Page)&ph, 0);
+	UT_ASSERT(PageGetLSNOrigin((Page)&ph, &origin));
+	UT_ASSERT_EQ(origin, 0);
+	UT_ASSERT_EQ(ph.pd_flags & (PD_HAS_ITL | PD_CLUSTER_FORCE_FPI),
+		PD_HAS_ITL | PD_CLUSTER_FORCE_FPI);
+	PageSetLSNOrigin((Page)&ph, PGRAC_PAGE_LSN_ORIGIN_MAX);
+	UT_ASSERT(PageGetLSNOrigin((Page)&ph, &origin));
+	UT_ASSERT_EQ(origin, PGRAC_PAGE_LSN_ORIGIN_MAX);
+	PageClearLSNOrigin((Page)&ph);
+	UT_ASSERT(!PageGetLSNOrigin((Page)&ph, &origin));
 }
 
 
@@ -197,7 +219,7 @@ UT_TEST(test_minimal_tuple_layout_matches_heap)
 int
 main(void)
 {
-	UT_PLAN(10);
+	UT_PLAN(11);
 	UT_RUN(test_page_header_total_size_is_32_bytes);
 	UT_RUN(test_pd_block_scn_offset_is_24);
 	UT_RUN(test_pd_block_scn_field_is_8_bytes);
@@ -205,6 +227,7 @@ main(void)
 	UT_RUN(test_invalid_scn_zero_init_is_natural);
 	UT_RUN(test_field_layout_below_pd_block_scn_unchanged);
 	UT_RUN(test_pd_has_itl_bit_value);
+	UT_RUN(test_page_lsn_origin_roundtrip_preserves_other_flags);
 	UT_RUN(test_heap_tuple_header_size_is_24);
 	UT_RUN(test_t_itl_slot_idx_offset_is_23);
 	UT_RUN(test_minimal_tuple_layout_matches_heap);

@@ -25,13 +25,22 @@
 #include "cluster/cluster_ic_tier1.h"
 #include "cluster/cluster_lms.h"
 #include "cluster/cluster_lms_shard.h"
+#include "cluster/cluster_membership.h"
 #include "cluster/cluster_multixact_current_wire.h"
+#include "cluster/cluster_multixact_current_stats.h"
 #include "cluster/cluster_pcm_lock.h"
+#include "cluster/cluster_qvotec.h"
+#include "cluster/cluster_reconfig.h"
 #include "cluster/cluster_recovery_merge.h"
 #include "cluster/cluster_r4_observe.h"
+#include "cluster/cluster_runtime_visibility.h"
 #include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_sf_dep.h"
+#include "cluster/cluster_terminal_ref_census.h"
 #include "cluster/cluster_touched_peers.h"
+#include "cluster/cluster_tt_durable.h"
+#include "cluster/cluster_tt_slot.h"
+#include "cluster/cluster_xid_stripe.h"
 #include "cluster/storage/cluster_undo_block0_current.h"
 #include "miscadmin.h"
 
@@ -111,6 +120,269 @@ int cluster_gcs_reply_timeout_ms = 5000;
 int cluster_gcs_block_retransmit_max_retries = 4;
 int cluster_gcs_block_retransmit_initial_backoff_ms = 10;
 bool cluster_ic_suppress_gcs_done_cap = false;
+
+uint64
+GetSystemIdentifier(void)
+{
+	return UINT64_C(0x524f555445);
+}
+
+ClusterMxResolveResult
+cluster_cr_server_current_mx_build_proof_page(
+	uint16 source_node_id pg_attribute_unused(),
+	const ClusterCurrentMxProofForwardV2 *request pg_attribute_unused(),
+	ClusterMxResolveResult result,
+	uint32 requester_capability_generation pg_attribute_unused(),
+	const ClusterCurrentMemberProof *proofs pg_attribute_unused(),
+	uint16 proof_count pg_attribute_unused(),
+	const ClusterCurrentUpdaterProof *updater_proof pg_attribute_unused(),
+	ClusterCurrentMxProofReplyPage *page pg_attribute_unused())
+{
+	return result;
+}
+
+bool
+cluster_ctrc_origin_ack_land_shared(uint64 request_id pg_attribute_unused(),
+								const ClusterCtrcLocalReleaseAckV1 *ack pg_attribute_unused())
+{
+	return false;
+}
+
+bool
+cluster_ctrc_origin_grant_publishable(
+	const ClusterCtrcTxnKeyV1 *key pg_attribute_unused(),
+	const ClusterCtrcParticipantIdentity *participant pg_attribute_unused(),
+	uint32 grant_generation pg_attribute_unused())
+{
+	return false;
+}
+
+bool
+cluster_ctrc_origin_note_certificate_reply_shared(
+	uint64 request_id pg_attribute_unused(),
+	uint16 participant_node_id pg_attribute_unused(),
+	ClusterCtrcSealReplyResult result pg_attribute_unused())
+{
+	return false;
+}
+
+bool
+cluster_ctrc_origin_note_close_reply_shared(
+	uint64 request_id pg_attribute_unused(),
+	uint16 participant_node_id pg_attribute_unused(),
+	ClusterCtrcSealReplyResult result pg_attribute_unused())
+{
+	return false;
+}
+
+bool
+cluster_ctrc_origin_request_snapshot_shared(
+	uint64 request_id pg_attribute_unused(),
+	uint16 participant_node_id pg_attribute_unused(),
+	ClusterCtrcTxnKeyV1 *key_out pg_attribute_unused(),
+	ClusterCtrcParticipantIdentity *identity_out pg_attribute_unused(),
+	uint32 *grant_generation_out pg_attribute_unused(),
+	uint64 *seal_generation_out pg_attribute_unused(),
+	ClusterCtrcSealSuboperation *suboperation_out pg_attribute_unused())
+{
+	return false;
+}
+
+ClusterCtrcTouchResult
+cluster_ctrc_origin_touch_exact(
+	const ClusterCtrcTxnKeyV1 *key pg_attribute_unused(),
+	const ClusterCtrcParticipantIdentity *participant pg_attribute_unused(),
+	ClusterCtrcProofClass proof_class pg_attribute_unused(),
+	uint32 *grant_out pg_attribute_unused())
+{
+	return CLUSTER_CTRC_TOUCH_REFUSED;
+}
+
+bool
+cluster_ctrc_seal_reply_decode(
+	const uint8 *page pg_attribute_unused(), Size page_length pg_attribute_unused(),
+	const uint8 *request_bytes pg_attribute_unused(),
+	Size request_length pg_attribute_unused(),
+	int32 expected_source_node pg_attribute_unused(),
+	int32 expected_destination_node pg_attribute_unused(),
+	ClusterCtrcSealReplyHeaderV1 *header_out pg_attribute_unused(),
+	ClusterCtrcLocalReleaseAckV1 *ack_out pg_attribute_unused())
+{
+	return false;
+}
+
+bool
+cluster_ctrc_seal_request_encode(
+	const ClusterCtrcTxnKeyV1 *key pg_attribute_unused(),
+	uint64 request_id pg_attribute_unused(),
+	uint32 grant_generation pg_attribute_unused(),
+	uint64 seal_generation pg_attribute_unused(),
+	uint32 participant_capability_record_generation pg_attribute_unused(),
+	ClusterCtrcSealSuboperation suboperation pg_attribute_unused(),
+	uint8 *bytes pg_attribute_unused(), Size length pg_attribute_unused())
+{
+	return false;
+}
+
+void
+cluster_ctrc_stat_bump(ClusterCtrcStatId stat pg_attribute_unused())
+{}
+
+void
+cluster_ctrc_test_barrier_wait(ClusterCtrcTestBarrierPhase phase pg_attribute_unused())
+{}
+
+uint64
+cluster_membership_get_last_admitted_incarnation(int32 node_id pg_attribute_unused())
+{
+	return UINT64_C(1);
+}
+
+bool
+cluster_membership_is_member(int32 node_id pg_attribute_unused())
+{
+	return true;
+}
+
+bool
+cluster_multixact_current_resolve_origin_member_proof(
+	TransactionId member_xid pg_attribute_unused(),
+	uint8 member_status pg_attribute_unused(),
+	uint16 member_ordinal pg_attribute_unused(),
+	uint16 member_origin_node pg_attribute_unused(),
+	uint32 current_epoch pg_attribute_unused(),
+	bool requester_self pg_attribute_unused(),
+	const ClusterTTStatusKey *initial_key pg_attribute_unused(),
+	const ClusterTTStatusResult *initial_result pg_attribute_unused(),
+	ClusterCurrentMxExactLookupFn exact_lookup pg_attribute_unused(),
+	void *exact_lookup_arg pg_attribute_unused(),
+	ClusterCurrentMemberProof *proof pg_attribute_unused())
+{
+	return false;
+}
+
+void
+cluster_multixact_current_stats_bump(ClusterCurrentMxStatId stat pg_attribute_unused())
+{}
+
+bool
+cluster_multixact_current_successor_provenance_well_formed(
+	const ClusterCurrentMxSuccessorAlias *alias,
+	const ClusterTxLocator *locator, TransactionId updater_xid,
+	uint16 updater_origin_node, uint32 current_epoch)
+{
+	return alias != NULL && locator != NULL
+		&& alias->local_xid == updater_xid
+		&& alias->origin_node_id == updater_origin_node
+		&& alias->cluster_epoch == current_epoch
+		&& locator->xid == updater_xid
+		&& !UBA_is_invalid(locator->uba);
+}
+
+uint64
+cluster_qvotec_get_self_incarnation(void)
+{
+	return UINT64_C(1);
+}
+
+uint64
+cluster_reconfig_get_observed_epoch(int32 node_id pg_attribute_unused())
+{
+	return UINT64_C(9);
+}
+
+bool
+cluster_reconfig_get_observed_slot(int32 node_id pg_attribute_unused(),
+							   uint64 *incarnation, uint64 *generation)
+{
+	if (incarnation != NULL)
+		*incarnation = UINT64_C(1);
+	if (generation != NULL)
+		*generation = UINT64_C(1);
+	return true;
+}
+
+bool
+cluster_runtime_visibility_origin_plan_canonical_diagnostic(
+	const ClusterRuntimeVisibilityOriginPlan *plan pg_attribute_unused(),
+	ClusterRuntimeVisibilityCanonicalDiagnostic *out)
+{
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	return false;
+}
+
+bool
+cluster_runtime_visibility_origin_plan_canonical_physical(
+	const ClusterRuntimeVisibilityOriginPlan *plan pg_attribute_unused(),
+	ClusterTTSlotPhysicalLocator *locator_out pg_attribute_unused(),
+	bool *same_segment_out pg_attribute_unused())
+{
+	return false;
+}
+
+bool
+cluster_runtime_visibility_physical_locator_sample_held(
+	const ClusterTTSlotPhysicalLocator *locator pg_attribute_unused(),
+	const ClusterSemanticAdmissionToken *admission pg_attribute_unused(),
+	ClusterUndoBlock0CurrentGuard *guard pg_attribute_unused(),
+	const ClusterUndoBlock0ResolvedRoot *root pg_attribute_unused(),
+	ClusterTTStatusKey *key_out pg_attribute_unused(),
+	ClusterTTStatusResult *result_out pg_attribute_unused(),
+	bool *ctrc_physical_active_out pg_attribute_unused())
+{
+	return false;
+}
+
+bool
+cluster_sf_peer_capability_generation_matches(
+	int32 peer_id pg_attribute_unused(),
+	uint32 required_capabilities pg_attribute_unused(),
+	uint32 expected_generation pg_attribute_unused())
+{
+	return true;
+}
+
+bool
+cluster_tt_slot_current_owner_by_xid(
+	int node_id pg_attribute_unused(), TransactionId xid pg_attribute_unused(),
+	ClusterTTSlotCurrentOwner *out pg_attribute_unused())
+{
+	return false;
+}
+
+ClusterTTDurableLocate
+cluster_tt_slot_durable_locate_any_by_xid_origin(
+	int origin_node pg_attribute_unused(), TransactionId xid pg_attribute_unused(),
+	uint16 *out_seg pg_attribute_unused(), uint16 *out_slot pg_attribute_unused(),
+	uint16 *out_wrap pg_attribute_unused(), uint8 *out_status pg_attribute_unused())
+{
+	return CLUSTER_TT_DURABLE_LOCATE_MISSING;
+}
+
+ClusterUndoBlock0Result
+cluster_undo_block0_current_sample_generation(
+	ClusterUndoBlock0CurrentGuard *guard pg_attribute_unused(),
+	const ClusterUndoBlock0ResolvedRoot *root pg_attribute_unused(),
+	ClusterUndoBlock0Generation *observed pg_attribute_unused())
+{
+	return CLUSTER_UNDO_BLOCK0_NOT_FOUND;
+}
+
+bool
+cluster_undo_block0_root_matches(
+	const ClusterUndoBlock0ResolvedRoot *observed,
+	const ClusterUndoBlock0ResolvedRoot *expected)
+{
+	return observed != NULL && expected != NULL
+		&& memcmp(observed, expected, sizeof(*observed)) == 0;
+}
+
+int
+cluster_xid_origin_slot(TransactionId xid pg_attribute_unused())
+{
+	return cluster_node_id;
+}
 
 static int reply_lock_acquire_calls;
 static int reply_lock_release_calls;
@@ -2773,7 +3045,9 @@ UT_TEST(test_current_mx_member_proof_requester_is_capability_bound_and_times_out
 	UT_ASSERT_EQ(cluster_gcs_current_mx_member_proof_fetch_and_wait(
 					 4, &request, proofs, lengthof(proofs),
 					 &proof_count, &updater,
-					 &requester_capability_generation),
+					 &requester_capability_generation,
+					 GetCurrentTimestamp()
+					 + (TimestampTz)cluster_gcs_reply_timeout_ms * 10000),
 				 CMX_RESOLVE_TIMEOUT);
 	UT_ASSERT_EQ(requester_capability_generation, (uint32)0);
 	UT_ASSERT_EQ(route_seam.current_mx_capability_calls, 1);
@@ -2806,7 +3080,7 @@ UT_TEST(test_current_mx_member_proof_requester_is_capability_bound_and_times_out
 	cluster_node_id = saved_node_id;
 }
 
-UT_TEST(test_current_mx_member_proof_forward128_routes_to_origin_serve)
+UT_TEST(test_current_mx_member_proof_forward128_routes_to_cooperative_origin)
 {
 	ClusterCurrentMxProofForwardV2 request;
 	ClusterICEnvelope env;
@@ -2835,15 +3109,10 @@ UT_TEST(test_current_mx_member_proof_forward128_routes_to_origin_serve)
 		UT_MASTER_NODE, sizeof(request));
 
 	UT_ASSERT(cluster_gcs_block_test_current_mx_forward128(&env, &request));
-	UT_ASSERT_EQ(route_seam.current_mx_proof_serve_calls, 1);
-	UT_ASSERT_EQ(route_seam.current_mx_proof_env.source_node_id,
-				 (uint32)UT_REQUESTER_NODE);
-	UT_ASSERT_EQ(route_seam.current_mx_proof_env.dest_node_id,
-				 (uint32)UT_MASTER_NODE);
-	UT_ASSERT_EQ(route_seam.current_mx_proof_request.prefix.request_id,
-				 UT_REQUEST_ID);
-	UT_ASSERT_EQ(route_seam.current_mx_proof_request.prefix.kind,
-				 GCS_BLOCK_FORWARD_KIND_CURRENT_MX_MEMBER_PROOF);
+	UT_ASSERT_EQ(route_seam.current_mx_proof_serve_calls, 0);
+	UT_ASSERT_EQ(cluster_gcs_block_test_r4_tx_origin_context_count(), 1);
+	cluster_gcs_block_test_r4_tx_origin_drain();
+	UT_ASSERT_EQ(cluster_gcs_block_test_r4_tx_origin_context_count(), 0);
 
 	cluster_node_id = saved_node_id;
 }
@@ -2896,7 +3165,9 @@ UT_TEST(test_current_mx_member_proof_reply_lands_in_current_domain)
 	UT_ASSERT_EQ(cluster_gcs_current_mx_member_proof_fetch_and_wait(
 					 4, &request, proofs, lengthof(proofs),
 					 &proof_count, &updater,
-					 &requester_capability_generation),
+					 &requester_capability_generation,
+					 GetCurrentTimestamp()
+					 + (TimestampTz)cluster_gcs_reply_timeout_ms * 10000),
 				 CMX_RESOLVE_DENIED);
 	UT_ASSERT_EQ(requester_capability_generation, (uint32)0);
 	UT_ASSERT_EQ(route_seam.enqueue_calls, 1);
@@ -4653,7 +4924,7 @@ main(void)
 	UT_RUN(test_current_mx_describe_reply_lands_in_current_domain);
 	UT_RUN(test_current_mx_describe_forward128_routes_to_origin_serve);
 	UT_RUN(test_current_mx_member_proof_requester_is_capability_bound_and_times_out_cleanly);
-	UT_RUN(test_current_mx_member_proof_forward128_routes_to_origin_serve);
+	UT_RUN(test_current_mx_member_proof_forward128_routes_to_cooperative_origin);
 	UT_RUN(test_current_mx_member_proof_reply_lands_in_current_domain);
 	UT_RUN(test_r4_requester_count_tracks_only_live_r4_domain_slots);
 	UT_RUN(test_r4_remote_requester_arms_request80_waits_full_and_releases);

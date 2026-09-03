@@ -108,6 +108,10 @@
 #include "access/heapam_xlog.h"
 #include "access/heaptoast.h"
 #include "access/rewriteheap.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_guc.h"
+#include "cluster/cluster_terminal_ref_census.h"
+#endif
 #include "access/transam.h"
 #include "access/xact.h"
 #include "access/xloginsert.h"
@@ -240,6 +244,22 @@ begin_heap_rewrite(Relation old_heap, Relation new_heap, TransactionId oldest_xm
 	MemoryContext rw_cxt;
 	MemoryContext old_cxt;
 	HASHCTL		hash_ctl;
+
+#ifdef USE_PGRAC_CLUSTER
+	/* A rewrite changes every physical TID.  Under the caller's
+	 * AccessExclusiveLock, require the bounded CTRC journal for the old
+	 * relfilenode to be fully terminal before copying any tuple bytes. */
+	if (cluster_enabled
+		&& old_heap->rd_rel->relpersistence != RELPERSISTENCE_TEMP
+		&& !cluster_ctrc_relation_removal_ready_shared(
+			(uint32)old_heap->rd_locator.spcOid,
+			(uint32)old_heap->rd_locator.dbOid,
+			(uint32)old_heap->rd_locator.relNumber))
+		ereport(ERROR,
+				(errcode(ERRCODE_CLUSTER_OBJECT_FLUSH_UNAVAILABLE),
+				 errmsg("could not drain terminal-reference receipts before heap rewrite"),
+				 errhint("Wait for canonical terminal-reference cleanout and retry.")));
+#endif
 
 	/*
 	 * To ease cleanup, make a separate context that will contain the

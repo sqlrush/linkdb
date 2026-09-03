@@ -687,7 +687,8 @@ UT_TEST(test_precrit_vm_barrier_refusal_unwinds_to_caller)
 
 		static const char *const wrapper_signature[]
 			= { "ClusterLockBufferExclusiveBarrierAware(Buffer buffer,",
-				"ClusterBufferBarrierSiteId site_id)" };
+				"ClusterBufferBarrierSiteId site_id,",
+				"bool *pin_replaced)" };
 
 		assert_ordered(bufmgr, wrapper_signature, lengthof(wrapper_signature));
 		assert_ordered(bufmgr, refusal_order, lengthof(refusal_order));
@@ -702,7 +703,8 @@ UT_TEST(test_precrit_vm_barrier_refusal_unwinds_to_caller)
 													  "cluster_heap_lock_with_vm_repin",
 													  "goto l2;" };
 		static const char *const requalify_order[]
-			= { "PGRAC: vm barrier unwind (update requalify)",
+			= { "PGRAC: BARRIER_CLOSED caller-owned unwind",
+				"if (!old_tuple_temp_locked)",
 				"LockBuffer(buffer, BUFFER_LOCK_UNLOCK)",
 				"cluster_heap_vm_barrier_warm",
 				"ReleaseBuffer(vmbuffer)",
@@ -1106,10 +1108,26 @@ UT_TEST(test_d11_passive_identity_probe_has_exact_sites_and_phase_chain)
 	}
 	if (heapam != NULL)
 	{
+		const char *stamp_helper = strstr(heapam,
+			"cluster_current_mx_stamp_lock_buffer(");
+		static const char *const stamp_helper_chain[]
+			= { "cluster_current_mx_stamp_lock_buffer(",
+				"if (barrier_aware)",
+				"ClusterLockBufferExclusiveBarrierAware(",
+				"buffer, site, pin_replaced)",
+				"cluster_current_mx_stamp_cancel(first)",
+				"cluster_current_mx_stamp_cancel(second)" };
+
 		for (int i = 0; i < lengthof(heap_sites); i++)
 			UT_ASSERT(strstr(heapam, heap_sites[i]) != NULL);
+		UT_ASSERT(stamp_helper != NULL);
+		if (stamp_helper != NULL)
+			assert_ordered(stamp_helper, stamp_helper_chain,
+						   lengthof(stamp_helper_chain));
+		/* One call is centralized in the current-MX cleanup helper; the
+		 * delete VM site remains the sole direct caller. */
 		UT_ASSERT_EQ(count_occurrences(heapam,
-									   "ClusterLockBufferExclusiveBarrierAware("), 6);
+									   "ClusterLockBufferExclusiveBarrierAware("), 2);
 
 		update = strstr(heapam, "PGRAC: BARRIER_CLOSED caller-owned unwind");
 		UT_ASSERT(update != NULL);
@@ -1241,10 +1259,82 @@ UT_TEST(test_aux_repin_replacement_restarts_from_fresh_relation_ref)
 	}
 }
 
+/* Ordinary VM writers use the same deliberate pinless Resource-X interval as
+ * direct-init.  A descriptor replacement is therefore a caller-owned retry,
+ * not a cluster-wide gate failure and not a client ERROR.  The barrier-aware
+ * wrapper must expose replacement separately, and heapam must invalidate the
+ * stale numeric Buffer before returning to its existing relation-level repin
+ * and requalification paths. */
+UT_TEST(test_ordinary_aux_repin_replacement_reaches_heap_retry)
+{
+	char *bufmgr = read_source(BUFMGR_SOURCE_PATH);
+	char *heapam = read_source(HEAPAM_SOURCE_PATH);
+	const char *wrapper;
+	const char *wrapper_end;
+	const char *refusal;
+	const char *helper;
+	const char *helper_end;
+
+	UT_ASSERT(bufmgr != NULL);
+	UT_ASSERT(heapam != NULL);
+	if (bufmgr != NULL)
+	{
+		wrapper = strstr(bufmgr,
+			"ClusterLockBufferExclusiveBarrierAware(Buffer buffer,");
+		wrapper_end = wrapper == NULL ? NULL
+			: strstr(wrapper, "\n}\n\n/*\n * Resource-X aware EXCLUSIVE lock");
+		refusal = strstr(bufmgr, "cluster_lockbuffer_barrier_refusal:");
+
+		UT_ASSERT(wrapper != NULL);
+		UT_ASSERT(wrapper_end != NULL);
+		UT_ASSERT(refusal != NULL);
+		if (wrapper != NULL && wrapper_end != NULL)
+		{
+			UT_ASSERT(strstr(wrapper, "bool *pin_replaced") < wrapper_end);
+			UT_ASSERT(strstr(wrapper, "&transient_refused") < wrapper_end);
+			UT_ASSERT(strstr(wrapper, "*pin_replaced = replaced") < wrapper_end);
+			UT_ASSERT(strstr(wrapper, "&& !replaced") < wrapper_end);
+		}
+		if (refusal != NULL)
+		{
+			const char *common_empty = strstr(refusal,
+				"CLUSTER_BUFFER_BARRIER_PHASE_COMMON_EMPTY");
+
+			UT_ASSERT(common_empty != NULL);
+			if (common_empty != NULL)
+			{
+				UT_ASSERT(strstr(refusal, "if (pcm_pin_replaced != NULL)")
+					< common_empty);
+				UT_ASSERT(strstr(refusal, "*pcm_pin_replaced = true;")
+					< common_empty);
+			}
+		}
+		free(bufmgr);
+	}
+	if (heapam != NULL)
+	{
+		helper = strstr(heapam, "cluster_current_mx_stamp_lock_buffer(");
+		helper_end = helper == NULL ? NULL : strstr(helper, "\n}\n");
+		UT_ASSERT(helper != NULL);
+		UT_ASSERT(helper_end != NULL);
+		if (helper != NULL && helper_end != NULL)
+		{
+			UT_ASSERT(strstr(helper, "bool *pin_replaced") < helper_end);
+			UT_ASSERT(strstr(helper,
+				"ClusterLockBufferExclusiveBarrierAware(buffer, site,")
+				< helper_end);
+		}
+		UT_ASSERT(strstr(heapam, "refused_pin_replaced = false;") != NULL);
+		UT_ASSERT(strstr(heapam, "if (refused_pin_replaced)") != NULL);
+		UT_ASSERT(strstr(heapam, "vmbuffer = InvalidBuffer;") != NULL);
+		free(heapam);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(30);
+	UT_PLAN(31);
 	UT_RUN(test_valid_read_miss_proof);
 	UT_RUN(test_valid_extend_proof);
 	UT_RUN(test_valid_vm_and_fsm_proofs);
@@ -1275,6 +1365,7 @@ main(void)
 	UT_RUN(test_cross_page_heap_pair_second_acquire_never_waits_under_first);
 	UT_RUN(test_d11_passive_identity_probe_has_exact_sites_and_phase_chain);
 	UT_RUN(test_aux_repin_replacement_restarts_from_fresh_relation_ref);
+	UT_RUN(test_ordinary_aux_repin_replacement_reaches_heap_retry);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

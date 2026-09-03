@@ -2325,11 +2325,11 @@ cluster_cr_server_local_freshref_c1b_pair_exact(
 	TransactionId xid, uint32 expected_segment_id,
 	uint32 expected_tt_slot_id, SCN proposed_scn, uint16 *out_wrap)
 {
-	LmsOwnXidReason reason;
 	uint8 verdict = 0;
 	SCN commit_scn = InvalidScn;
 	SCN horizon_scn = InvalidScn;
 	uint16 wrap = 0;
+	LmsOwnXidReason reason;
 
 	if (out_wrap != NULL)
 		*out_wrap = 0;

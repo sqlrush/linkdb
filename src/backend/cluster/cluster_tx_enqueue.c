@@ -112,6 +112,21 @@ static ClusterTxwShmem *ClusterTxw = NULL;
  * a wake is lost. */
 #define CLUSTER_TXW_TICK_MS 1000
 
+static uint64
+txw_monotonic_us(void)
+{
+	instr_time now;
+
+	INSTR_TIME_SET_CURRENT(now);
+	return (uint64)INSTR_TIME_GET_MICROSEC(now);
+}
+
+static uint64
+txw_saturating_add_us(uint64 base, uint64 delta)
+{
+	return base > UINT64_MAX - delta ? UINT64_MAX : base + delta;
+}
+
 
 static inline bool
 txw_key_equal(const ClusterTTStatusKey *a, const ClusterTTStatusKey *b)
@@ -402,10 +417,11 @@ cluster_tx_enqueue_cleanup_on_backend_exit_callback(int code pg_attribute_unused
 static ClusterTxwResult
 cluster_tx_enqueue_wait_internal(const ClusterTTStatusKey *holder_key,
 								 int effective_timeout_ms,
-								 bool current_mx_wait)
+								 bool current_mx_wait,
+								 uint64 current_mx_deadline_mono_us)
 {
 	int procno;
-	TimestampTz deadline;
+	TimestampTz source_deadline = 0;
 	ClusterTxwResult result = CLUSTER_TXW_TIMEOUT;
 	ClusterLmdVertex tx_wfg_waiter;
 	bool tx_wfg_registered = false;
@@ -431,7 +447,12 @@ cluster_tx_enqueue_wait_internal(const ClusterTTStatusKey *holder_key,
 		return CLUSTER_TXW_TIMEOUT;
 	}
 
-	deadline = GetCurrentTimestamp() + (TimestampTz)effective_timeout_ms * 1000;
+	if (current_mx_wait) {
+		if (current_mx_deadline_mono_us == 0)
+			return CLUSTER_TXW_UNPROVABLE;
+	} else
+		source_deadline = GetCurrentTimestamp()
+			+ (TimestampTz)effective_timeout_ms * 1000;
 
 	if (!txw_slot_set(procno, holder_key, current_mx_wait))
 		return CLUSTER_TXW_UNPROVABLE;
@@ -492,11 +513,6 @@ cluster_tx_enqueue_wait_internal(const ClusterTTStatusKey *holder_key,
 	PG_TRY();
 	{
 		for (;;) {
-				ClusterTTStatusResult cres;
-				ClusterTTStatusSourceRequest source_request;
-				ClusterTTStatusSourceResult source_result;
-				bool found;
-				TimestampTz now;
 				long wait_ms;
 
 				ResetLatch(MyLatch);
@@ -512,28 +528,71 @@ cluster_tx_enqueue_wait_internal(const ClusterTTStatusKey *holder_key,
 					break;
 				}
 
+				/*
+				 * Active R4 current-MX has no SOURCE authority to consult.  Keep
+				 * the exact TX/WFG registration for one bounded native wake/poll
+				 * slice, clean it below, and require the heap caller to restart
+				 * from tuple capture + DESCRIBE.  The operation-owned absolute
+				 * deadline survives that restart and prevents budget refresh.
+				 */
+				if (current_mx_wait) {
+					uint64 now_us = txw_monotonic_us();
+					uint64 remaining_us;
+
+					if (now_us >= current_mx_deadline_mono_us) {
+						result = CLUSTER_TXW_TIMEOUT;
+						pg_atomic_fetch_add_u64(&ClusterTxw->timeout_count, 1);
+						break;
+					}
+					remaining_us = current_mx_deadline_mono_us - now_us;
+					if (remaining_us >= (uint64)CLUSTER_TXW_TICK_MS * UINT64_C(1000))
+						wait_ms = CLUSTER_TXW_TICK_MS;
+					else {
+						wait_ms = (long)(remaining_us / UINT64_C(1000));
+						if (remaining_us % UINT64_C(1000) != 0)
+							wait_ms++;
+						if (wait_ms <= 0)
+							wait_ms = 1;
+					}
+					(void)WaitLatch(MyLatch,
+								WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+								wait_ms, WAIT_EVENT_GES_TX_ENQUEUE_WAIT);
+					CHECK_FOR_INTERRUPTS();
+					result = CLUSTER_TXW_RETRY;
+					break;
+				}
+
 				/* Re-check the holder's TT status (closes the register/wake race:
 				 * a terminal status published before we slept is seen here). */
-				memset(&source_request, 0, sizeof(source_request));
-				source_request.key = holder_key;
-				found = cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_LOOKUP,
-														  &source_request, &source_result)
+				{
+					ClusterTTStatusResult cres;
+					ClusterTTStatusSourceRequest source_request;
+					ClusterTTStatusSourceResult source_result;
+					bool found;
+					TimestampTz now;
+
+					memset(&source_request, 0, sizeof(source_request));
+					source_request.key = holder_key;
+					found = cluster_tt_status_source_dispatch(
+						CLUSTER_TT_SOURCE_LOOKUP, &source_request, &source_result)
 						== CLUSTER_SEMANTIC_ADMISSION_OK
-					&& source_result.bool_value;
-				cres = source_result.lookup;
-				if (found && cres.authoritative && txw_status_is_terminal(cres.status)) {
-					result = CLUSTER_TXW_RESOLVED;
-					break;
-				}
+						&& source_result.bool_value;
+					cres = source_result.lookup;
+					if (found && cres.authoritative
+						&& txw_status_is_terminal(cres.status)) {
+						result = CLUSTER_TXW_RESOLVED;
+						break;
+					}
 
-				now = GetCurrentTimestamp();
-				if (now >= deadline) {
-					result = CLUSTER_TXW_TIMEOUT;
-					pg_atomic_fetch_add_u64(&ClusterTxw->timeout_count, 1);
-					break;
-				}
+					now = GetCurrentTimestamp();
+					if (now >= source_deadline) {
+						result = CLUSTER_TXW_TIMEOUT;
+						pg_atomic_fetch_add_u64(&ClusterTxw->timeout_count, 1);
+						break;
+					}
 
-				wait_ms = (long)((deadline - now) / 1000);
+					wait_ms = (long)((source_deadline - now) / 1000);
+				}
 				if (wait_ms <= 0)
 					wait_ms = 1;
 				if (wait_ms > CLUSTER_TXW_TICK_MS)
@@ -761,15 +820,30 @@ cluster_tx_enqueue_wait(const ClusterTTStatusKey *holder_key,
 						int effective_timeout_ms)
 {
 	return cluster_tx_enqueue_wait_internal(holder_key, effective_timeout_ms,
-											false);
+											false, 0);
 }
 
 ClusterTxwResult
 cluster_tx_enqueue_wait_current_mx(const ClusterTTStatusKey *holder_key,
-								   int effective_timeout_ms)
+								   int effective_timeout_ms,
+								   uint64 *absolute_deadline_mono_us)
 {
+	uint64 now_us;
+	uint64 timeout_us;
+
+	if (absolute_deadline_mono_us == NULL)
+		return CLUSTER_TXW_UNPROVABLE;
+	if (effective_timeout_ms <= 0)
+		effective_timeout_ms = CLUSTER_TXW_DEFAULT_TIMEOUT_MS;
+	if (*absolute_deadline_mono_us == 0) {
+		now_us = txw_monotonic_us();
+		timeout_us = (uint64)effective_timeout_ms > UINT64_MAX / UINT64_C(1000)
+			? UINT64_MAX
+			: (uint64)effective_timeout_ms * UINT64_C(1000);
+		*absolute_deadline_mono_us = txw_saturating_add_us(now_us, timeout_us);
+	}
 	return cluster_tx_enqueue_wait_internal(holder_key, effective_timeout_ms,
-										true);
+										true, *absolute_deadline_mono_us);
 }
 
 void

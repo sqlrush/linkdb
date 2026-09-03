@@ -247,6 +247,12 @@ cluster_ctrc_receipt_discharge_itl_shared(
 	return CLUSTER_CTRC_DISCHARGE_CLEANED;
 }
 
+void
+cluster_ctrc_note_publication_after_apply(
+	const ClusterCtrcReceiptHandle *handle pg_attribute_unused(),
+	bool current_mx pg_attribute_unused())
+{}
+
 static ClusterItlSlotData *
 reset_registration_fixture(TransactionId xid)
 {
@@ -574,6 +580,39 @@ UT_TEST(u39_same_slot_recapture_replaces_only_the_eager_receipt_handle)
 		((const uint8 *)&slot->undo_segment_head)[0]);
 }
 
+UT_TEST(u40_reuse_lookup_returns_only_the_exact_live_itl_receipt)
+{
+	ClusterItlTouchHandle touch = registration_handle();
+	TransactionId xid = 700;
+	ClusterItlSlotData *slot = reset_registration_fixture(xid);
+	ClusterCtrcReceiptHandle registered;
+	ClusterCtrcReceiptHandle found;
+
+	slot->undo_segment_head.raw[0] = UINT64_C(0x1111222233334444);
+	slot->undo_segment_head.raw[1] = UINT64_C(0x5555666677778888);
+	registered = registration_ctrc_handle(0, &touch, slot);
+	test_capture_authority = true;
+	cluster_itl_touch_register_exact_ctrc(&touch, 1, xid, &registered);
+
+	MemSet(&found, 0, sizeof(found));
+	UT_ASSERT(cluster_itl_touch_lookup_reusable_ctrc(
+		&touch, 1, xid, &found));
+	UT_ASSERT(found.valid);
+	UT_ASSERT(found.receipt == registered.receipt);
+	UT_ASSERT_EQ(found.journal_slot_generation,
+		registered.journal_slot_generation);
+
+	slot->undo_segment_head.raw[1]++;
+	UT_ASSERT(!cluster_itl_touch_lookup_reusable_ctrc(
+		&touch, 1, xid, &found));
+	UT_ASSERT(!found.valid);
+	slot->undo_segment_head.raw[1]--;
+	test_own_generation++;
+	UT_ASSERT(!cluster_itl_touch_lookup_reusable_ctrc(
+		&touch, 1, xid, &found));
+	UT_ASSERT(!found.valid);
+}
+
 UT_TEST(u21_first_failed_capture_does_not_append)
 {
 	ClusterItlTouchHandle handle = registration_handle();
@@ -821,7 +860,7 @@ UT_TEST(u34_epoch_drift_preserves_active_slot)
 int
 main(void)
 {
-	UT_PLAN(27);
+	UT_PLAN(28);
 	UT_RUN(u13_exact_owner_proof_matches);
 	UT_RUN(u14_missing_owner_proof_is_rejected);
 	UT_RUN(u15_later_x_generation_is_rejected);
@@ -849,5 +888,6 @@ main(void)
 	UT_RUN(u37_data_commit_retains_applied_receipt_for_lazy_cleanout);
 	UT_RUN(u38_lock_only_commit_discharges_terminal_independent_receipt);
 	UT_RUN(u39_same_slot_recapture_replaces_only_the_eager_receipt_handle);
+	UT_RUN(u40_reuse_lookup_returns_only_the_exact_live_itl_receipt);
 	UT_DONE();
 }

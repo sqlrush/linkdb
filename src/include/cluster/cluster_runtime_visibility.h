@@ -37,6 +37,7 @@
 #include "access/xlogdefs.h"
 #include "cluster/cluster_itl_slot.h" /* UBA */
 #include "cluster/cluster_scn.h"	  /* SCN */
+#include "utils/timestamp.h"
 
 #ifdef USE_PGRAC_CLUSTER
 /*
@@ -184,6 +185,9 @@ cluster_runtime_visibility_origin_plan_freeze_data_held(
 extern bool cluster_runtime_visibility_origin_plan_canonical_logical(
 	const ClusterRuntimeVisibilityOriginPlan *plan,
 	ClusterUndoBlock0LogicalKey *logical_out);
+extern bool cluster_runtime_visibility_origin_plan_canonical_physical(
+	const ClusterRuntimeVisibilityOriginPlan *plan,
+	ClusterTTSlotPhysicalLocator *locator_out, bool *same_segment_out);
 extern bool cluster_runtime_visibility_origin_plan_sample_canonical_held(
 	ClusterRuntimeVisibilityOriginPlan *plan, ClusterTxResolveMode mode,
 	const ClusterSemanticAdmissionToken *admission,
@@ -193,9 +197,10 @@ extern bool cluster_runtime_visibility_origin_plan_sample_canonical_held(
 extern bool cluster_runtime_visibility_origin_plan_canonical_diagnostic(
 	const ClusterRuntimeVisibilityOriginPlan *plan,
 	ClusterRuntimeVisibilityCanonicalDiagnostic *out);
-/* Current-MultiXact consumes the R4 TARGET canonical physical TT slot.  The
- * allocator snapshot is only a locator/corroboration input and cannot create
- * an ACTIVE or terminal result by itself. */
+/* Current-MultiXact consumes the R4 TARGET canonical physical TT slot.  A
+ * same-backend published binding is the exact locator across CURRENT segment
+ * rollover; otherwise the allocator snapshot is only locator/corroboration.
+ * Neither can create an ACTIVE or terminal result from nonmatching bytes. */
 extern bool cluster_runtime_visibility_current_owner_sample_held(
 	TransactionId xid, const ClusterTTSlotCurrentOwner *expected_owner,
 	const ClusterSemanticAdmissionToken *admission,
@@ -226,6 +231,15 @@ extern bool cluster_runtime_visibility_current_owner_lookup_exact_ctrc_full(
 extern bool cluster_runtime_visibility_local_terminal_lookup_exact(
 	TransactionId xid, ClusterTTStatusKey *key_out,
 	ClusterTTStatusResult *result_out);
+/* Resolve an updater from its exact page-derived DATA locator.  The function
+ * executes the same DATA -> canonical TT -> DATA proof used by the remote
+ * origin adapter and never substitutes a by-xid locator. */
+extern bool cluster_runtime_visibility_current_mx_updater_provenance_exact(
+	const ClusterTxLocator *locator, TimestampTz deadline,
+	ClusterTTStatusKey *key_out, ClusterTTStatusResult *result_out,
+	uint32 *ctrc_grant_out,
+	uint32 *participant_capability_generation_out,
+	bool *cross_segment_out);
 extern bool cluster_runtime_visibility_active_proof_ctrc_identity_exact(
 	const ClusterTTStatusKey *proof_key, uint32 ctrc_grant,
 	uint32 requester_capability_generation,

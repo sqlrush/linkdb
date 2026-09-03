@@ -284,8 +284,42 @@ static inline bool
 ges_request_uses_dedup(uint32 opcode)
 {
 	return opcode == GES_REQ_OPCODE_REQUEST || opcode == GES_REQ_OPCODE_CONVERT
-		   || opcode == GES_REQ_OPCODE_RELEASE
+		   || opcode == GES_REQ_OPCODE_REDECLARE
 		   || opcode == GES_REQ_OPCODE_REQUEST_NOWAIT; /* spec-5.5 D5 — idempotent retransmit */
+}
+
+/*
+ * A causally later exact RELEASE proves that the requester consumed the grant
+ * and cannot issue another retransmit of that acquisition on the same ordered
+ * peer stream.  Retire only completed receipts; the dedup layer refuses to
+ * remove an in-flight entry.  RELEASE itself bypasses dedup because
+ * cluster_grd_release_and_drain performs no queue drain when the exact holder
+ * is absent, making a lost-ACK replay an idempotent no-op.
+ */
+static void
+ges_forget_holder_acquire_receipts(uint32 source_node_id,
+								   const ClusterGrdHolderId *holder,
+								   uint64 shard_master_generation)
+{
+	static const uint32 acquisition_opcodes[] = {
+		GES_REQ_OPCODE_REQUEST,
+		GES_REQ_OPCODE_REQUEST_NOWAIT,
+		GES_REQ_OPCODE_CONVERT,
+		GES_REQ_OPCODE_REDECLARE,
+	};
+	ClusterGesDedupKey key;
+
+	Assert(holder != NULL);
+	memset(&key, 0, sizeof(key));
+	key.origin_node_id = source_node_id;
+	key.request_id = holder->request_id;
+	key.cluster_epoch = holder->cluster_epoch;
+	key.shard_master_generation = shard_master_generation;
+	key.holder_procno = holder->procno;
+	for (int i = 0; i < lengthof(acquisition_opcodes); i++) {
+		key.opcode = acquisition_opcodes[i];
+		(void)cluster_ges_dedup_remove_completed(&key);
+	}
 }
 
 static void
@@ -893,10 +927,7 @@ cluster_ges_request_handler(const ClusterICEnvelope *env, const void *payload)
 	 *	GesReplyPayload via lmon_reply outbound, skip work_queue.  FULL ->
 	 *	REJECT_BUSY fail-closed.  MISS_REGISTERED -> proceed to enqueue.
 	 */
-	if (req->opcode == GES_REQ_OPCODE_REQUEST || req->opcode == GES_REQ_OPCODE_CONVERT
-		|| req->opcode == GES_REQ_OPCODE_RELEASE || req->opcode == GES_REQ_OPCODE_REDECLARE
-		|| req->opcode == GES_REQ_OPCODE_CONVERT_ROLLBACK
-		|| req->opcode == GES_REQ_OPCODE_REQUEST_NOWAIT) {
+	if (ges_request_uses_dedup(req->opcode)) {
 		/* spec-5.5 D5 / §3.5 T6 — NOWAIT joins the dedup pre-lookup so a lost
 		 * GRANT/REJECT reply retransmits idempotently:  the retransmit hits
 		 * CACHED_REPLY (dkey.opcode == 15 distinguishes it from a blocking
@@ -1658,12 +1689,15 @@ cluster_ges_lmon_drain_work_queue(void)
 
 			if (cluster_authority_readiness_managed()
 				&& !cluster_serving_ready_is_current()) {
+				ClusterGrdEntryResult release_result;
+
 				/* Recovery releases may remove only the exact CF/WALR holder.
 				 * Promoting a pre-existing ordinary waiter would publish service
 				 * before SERVING_READY. */
 				n_granted = 0;
-				if (cluster_grd_release_holder_by_id(&resid, &holder)
-					!= CLUSTER_GRD_ENTRY_OK) {
+				release_result = cluster_grd_release_holder_by_id(&resid, &holder);
+				if (release_result != CLUSTER_GRD_ENTRY_OK
+					&& release_result != CLUSTER_GRD_ENTRY_NOT_FOUND) {
 					ges_dispatch_reject((int32)item.source_node_id, &holder,
 									&resid, req->opcode,
 									GES_REJECT_REASON_WORK_QUEUE_FULL,
@@ -1673,9 +1707,20 @@ cluster_ges_lmon_drain_work_queue(void)
 			} else {
 				n_granted = cluster_grd_release_and_drain(
 					&resid, &holder, granted, lengthof(granted));
-				if (n_granted < 0)
+				if (n_granted == CLUSTER_GRD_RELEASE_NOT_READY) {
+					ges_dispatch_reject((int32)item.source_node_id, &holder,
+									&resid, req->opcode,
+									GES_REJECT_REASON_WORK_QUEUE_FULL,
+									ges_request_shard_master_generation(req));
+					break;
+				}
+				if (n_granted == CLUSTER_GRD_RELEASE_NOT_FOUND)
 					n_granted = 0;
 			}
+
+			ges_forget_holder_acquire_receipts(
+				(uint32)item.source_node_id, &holder,
+				ges_request_shard_master_generation(req));
 
 			/* Reply GRANT to the original releaser (acks the RELEASE). */
 			{
@@ -2725,7 +2770,8 @@ cluster_ges_send_release_and_wait(const struct ClusterResId *resid,
 	 *	GRANT reply.
 	 */
 	epoch = cluster_epoch_get_current();
-	/* spec-2.27 D3 — retransmit + dedup on RELEASE.  Sample
+	/* spec-2.27 D3 — retransmit RELEASE.  Receiver replay safety comes from
+	 * exact-holder idempotence rather than a retained dedup receipt.  Sample
 	 * shard_master_generation once; perpetual timeout supported. */
 	{
 		uint64 master_gen = cluster_lms_get_shard_master_generation();

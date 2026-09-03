@@ -86,8 +86,8 @@ UT_DEFINE_GLOBALS();
 #ifndef UNDO_XLOG_SOURCE_PATH
 #error "UNDO_XLOG_SOURCE_PATH must identify cluster_undo_xlog.c"
 #endif
-#ifndef UNDO_FORMAT_HEADER_PATH
-#error "UNDO_FORMAT_HEADER_PATH must identify cluster_undo_format.h"
+#ifndef TT_SLOT_HEADER_PATH
+#error "TT_SLOT_HEADER_PATH must identify cluster_tt_slot.h"
 #endif
 
 
@@ -1271,6 +1271,8 @@ UT_TEST(test_record_prepare_owns_extent_and_block0_slow_paths)
 UT_TEST(test_prepared_consumer_rechecks_exact_receipt_before_record_mutation)
 {
 	char *source = read_undo_record_source();
+	const char *preflight;
+	const char *preflight_end;
 	const char *consume;
 	const char *consume_end;
 	const char *recheck;
@@ -1279,27 +1281,117 @@ UT_TEST(test_prepared_consumer_rechecks_exact_receipt_before_record_mutation)
 
 	if (source == NULL)
 		return;
-	consume = strstr(source, "\ncluster_undo_record_consume_prepared(");
+	preflight = strstr(source, "\ncluster_undo_record_consume_preflight(");
+	preflight_end = preflight == NULL ? NULL
+		: strstr(preflight,
+			"\n}\n\n\nClusterUndoRecordConsumeResult\ncluster_undo_record_consume_prepared(");
+	consume = preflight_end;
 	consume_end = consume == NULL ? NULL
 		: strstr(consume, "\n}\n\n\nUBA\ncluster_undo_record_alloc(");
-	recheck = consume == NULL ? NULL
-		: strstr(consume,
+	recheck = preflight == NULL ? NULL
+		: strstr(preflight,
 			"cluster_undo_block0_current_live_owner_publication_recheck_conditional(");
-	extent_match = consume == NULL ? NULL
-		: strstr(consume, "cluster_undo_record_receipt_extent_matches(");
+	extent_match = preflight == NULL ? NULL
+		: strstr(preflight, "cluster_undo_record_receipt_extent_matches(");
 	first_mutation = consume == NULL ? NULL
 		: strstr(consume, "cluster_scn_advance(");
 
+	UT_ASSERT_NOT_NULL(preflight);
+	UT_ASSERT_NOT_NULL(preflight_end);
 	UT_ASSERT_NOT_NULL(consume);
 	UT_ASSERT_NOT_NULL(consume_end);
 	UT_ASSERT_NOT_NULL(recheck);
 	UT_ASSERT_NOT_NULL(extent_match);
 	UT_ASSERT_NOT_NULL(first_mutation);
-	if (consume != NULL && consume_end != NULL && recheck != NULL
-		&& extent_match != NULL && first_mutation != NULL)
-		UT_ASSERT(consume < extent_match && extent_match < recheck
-				  && recheck < first_mutation && first_mutation < consume_end);
+	if (preflight != NULL && preflight_end != NULL && consume != NULL
+		&& consume_end != NULL && recheck != NULL && extent_match != NULL
+		&& first_mutation != NULL)
+		UT_ASSERT(preflight < extent_match && extent_match < recheck
+				  && recheck < preflight_end && preflight_end == consume
+				  && consume < first_mutation && first_mutation < consume_end);
 	free(source);
+}
+
+
+/* The undo DATA content lock is the final fallible local prerequisite for a
+ * prepared consume.  It must be acquired conditionally before the first CTRC
+ * APPLY, while a miss can still take the zero-apply retry edge.  Once APPLY
+ * starts, consume may only install through that already-held exact lock; it
+ * must not attempt a second conditional acquisition that can fail after the
+ * receipt has become irreversible. */
+UT_TEST(test_prepared_consume_lock_precedes_first_receipt_apply)
+{
+	char *record_source = read_undo_record_source();
+	char *heap_source = read_heapam_source();
+	const char *preflight;
+	const char *preflight_end;
+	const char *conditional_lock;
+	const char *consume;
+	const char *consume_end;
+	const char *locked_install;
+	const char *late_conditional;
+	const char *boundary;
+	const char *boundary_end;
+	const char *boundary_preflight;
+	const char *first_apply;
+
+	if (record_source == NULL || heap_source == NULL)
+	{
+		free(record_source);
+		free(heap_source);
+		return;
+	}
+	preflight = strstr(record_source,
+		"\ncluster_undo_record_consume_preflight(");
+	preflight_end = preflight == NULL ? NULL
+		: strstr(preflight,
+			"\n}\n\n\nClusterUndoRecordConsumeResult\ncluster_undo_record_consume_prepared(");
+	conditional_lock = preflight == NULL ? NULL
+		: strstr(preflight, "cluster_undo_buf_lock_ref_conditional(");
+	consume = preflight_end;
+	consume_end = consume == NULL ? NULL
+		: strstr(consume, "\n}\n\n\nUBA\ncluster_undo_record_alloc(");
+	locked_install = consume == NULL ? NULL
+		: strstr(consume,
+			"cluster_undo_record_install_prepared_resident_locked(");
+	late_conditional = consume == NULL ? NULL
+		: strstr(consume, "cluster_undo_buf_lock_ref_conditional(");
+
+	boundary = strstr(heap_source, "/* One caller-owned final boundary.");
+	boundary = boundary == NULL ? NULL
+		: strstr(boundary, "\ncluster_heap_no_retry_boundary_apply(");
+	boundary_end = boundary == NULL ? NULL
+		: strstr(boundary, "\n}\n\n\n#ifdef USE_CLUSTER_UNIT");
+	boundary_preflight = boundary == NULL ? NULL
+		: strstr(boundary, "cluster_undo_record_consume_preflight(");
+	first_apply = boundary == NULL ? NULL
+		: strstr(boundary, "cluster_heap_boundary_apply_undo_target(");
+
+	UT_ASSERT_NOT_NULL(preflight);
+	UT_ASSERT_NOT_NULL(preflight_end);
+	UT_ASSERT_NOT_NULL(conditional_lock);
+	UT_ASSERT_NOT_NULL(consume);
+	UT_ASSERT_NOT_NULL(consume_end);
+	UT_ASSERT_NOT_NULL(locked_install);
+	UT_ASSERT(late_conditional == NULL || late_conditional >= consume_end);
+	UT_ASSERT_NOT_NULL(boundary);
+	UT_ASSERT_NOT_NULL(boundary_end);
+	UT_ASSERT_NOT_NULL(boundary_preflight);
+	UT_ASSERT_NOT_NULL(first_apply);
+	if (preflight != NULL && preflight_end != NULL
+		&& conditional_lock != NULL)
+		UT_ASSERT(preflight < conditional_lock
+				  && conditional_lock < preflight_end);
+	if (consume != NULL && consume_end != NULL && locked_install != NULL)
+		UT_ASSERT(consume < locked_install && locked_install < consume_end);
+	if (boundary != NULL && boundary_end != NULL
+		&& boundary_preflight != NULL && first_apply != NULL)
+		UT_ASSERT(boundary < boundary_preflight
+				  && boundary_preflight < first_apply
+				  && first_apply < boundary_end);
+
+	free(record_source);
+	free(heap_source);
 }
 
 /* The terminal census may drop and reacquire heap content authority.  That
@@ -1369,6 +1461,13 @@ UT_TEST(test_ctrc_cross_page_update_requires_both_prepared_receipts)
 	receipt.ctrc_handles[1].valid = true;
 	UT_ASSERT(cluster_undo_record_ctrc_required_prepared(
 		&receipt, UINT8_C(3)));
+	receipt.ctrc_reuse_mask = UINT8_C(1);
+	UT_ASSERT(cluster_undo_record_ctrc_required_prepared(
+		&receipt, UINT8_C(3)));
+	receipt.ctrc_reuse_mask = UINT8_C(4);
+	UT_ASSERT(!cluster_undo_record_ctrc_required_prepared(
+		&receipt, UINT8_C(3)));
+	receipt.ctrc_reuse_mask = 0;
 
 	receipt.ctrc_prepared_mask = UINT8_C(1);
 	UT_ASSERT(!cluster_undo_record_ctrc_required_prepared(
@@ -1388,20 +1487,19 @@ UT_TEST(test_ctrc_cross_page_update_requires_both_prepared_receipts)
 }
 
 /* The UPDATE caller must route both same-page and cross-page passes through
- * the shared required-mask gate.  APPLY must precede undo consumption, and
- * the later physical stamps must use the SCNs frozen by the exact plans. */
+ * the shared required-mask gate.  It first adopts an exact same-ITL receipt
+ * while both page locks remain held; only a miss reaches blocking PREPARE
+ * after unlock. */
 UT_TEST(test_heap_update_applies_required_receipts_before_undo_and_page_mutation)
 {
 	char *source = read_heapam_source();
 	const char *update;
 	const char *update_end;
 	const char *stage;
+	const char *reuse;
 	const char *prepare;
 	const char *required;
-	const char *apply;
-	const char *consume;
-	const char *old_stamp_scn;
-	const char *new_stamp_scn;
+	const char *unlock;
 
 	if (source == NULL)
 		return;
@@ -1409,35 +1507,26 @@ UT_TEST(test_heap_update_applies_required_receipts_before_undo_and_page_mutation
 	update_end = update == NULL ? NULL : strstr(update, "\nheap_lock_tuple(");
 	stage = update == NULL ? NULL
 		: strstr(update, "cluster_undo_record_ctrc_stage_pending(");
+	reuse = update == NULL ? NULL
+		: strstr(update, "cluster_heap_ctrc_stage_reusable_itl_receipt(");
 	prepare = update == NULL ? NULL
 		: strstr(update, "cluster_undo_record_ctrc_prepare_pending(");
 	required = update == NULL ? NULL
 		: strstr(update, "cluster_undo_record_ctrc_required_prepared(");
-	apply = update == NULL ? NULL
-		: strstr(update, "cluster_undo_record_ctrc_apply_prepared(");
-	consume = update == NULL ? NULL
-		: strstr(update, "cluster_undo_record_consume_prepared(");
-	old_stamp_scn = update == NULL ? NULL
-		: strstr(update, "cluster_itl_old_write_scn, cluster_itl_uba");
-	new_stamp_scn = update == NULL ? NULL
-		: strstr(update, "cluster_itl_new_write_scn, cluster_itl_uba");
+	unlock = reuse == NULL ? NULL
+		: strstr(reuse, "LockBuffer(buffer, BUFFER_LOCK_UNLOCK);");
 
 	UT_ASSERT_NOT_NULL(update);
 	UT_ASSERT_NOT_NULL(update_end);
 	UT_ASSERT_NOT_NULL(stage);
+	UT_ASSERT_NOT_NULL(reuse);
 	UT_ASSERT_NOT_NULL(prepare);
 	UT_ASSERT_NOT_NULL(required);
-	UT_ASSERT_NOT_NULL(apply);
-	UT_ASSERT_NOT_NULL(consume);
-	UT_ASSERT_NOT_NULL(old_stamp_scn);
-	UT_ASSERT_NOT_NULL(new_stamp_scn);
-	if (update != NULL && update_end != NULL && stage != NULL
-		&& prepare != NULL && required != NULL && apply != NULL
-		&& consume != NULL && old_stamp_scn != NULL && new_stamp_scn != NULL)
-		UT_ASSERT(update < stage && stage < required
-			&& required < apply && apply < consume && consume < prepare
-			&& prepare < old_stamp_scn && old_stamp_scn < new_stamp_scn
-			&& new_stamp_scn < update_end);
+	UT_ASSERT_NOT_NULL(unlock);
+	if (update != NULL && update_end != NULL && stage != NULL && reuse != NULL
+		&& prepare != NULL && required != NULL && unlock != NULL)
+		UT_ASSERT(update < stage && stage < reuse && reuse < required
+			&& required < unlock && unlock < prepare && prepare < update_end);
 	free(source);
 }
 
@@ -1449,7 +1538,7 @@ UT_TEST(test_ctrc_release_flag_terminal_recycle_reuse_and_redo_matrix)
 {
 	char *xlog_header = read_source_file(UNDO_XLOG_HEADER_PATH);
 	char *xlog_source = read_source_file(UNDO_XLOG_SOURCE_PATH);
-	char *format_header = read_source_file(UNDO_FORMAT_HEADER_PATH);
+	char *format_header = read_source_file(TT_SLOT_HEADER_PATH);
 
 	if (xlog_header == NULL || xlog_source == NULL || format_header == NULL)
 	{
@@ -1465,7 +1554,7 @@ UT_TEST(test_ctrc_release_flag_terminal_recycle_reuse_and_redo_matrix)
 	UT_ASSERT_NOT_NULL(strstr(xlog_source,
 		"cluster_undo_xlog_insert_tt_ctrc_release"));
 	UT_ASSERT_NOT_NULL(strstr(xlog_source,
-		"TT_SLOT_FLAG_CTRC_RELEASE_PROVEN"));
+		"cluster_tt_durable_redo_ctrc_release_slot_exact"));
 	UT_ASSERT_NOT_NULL(strstr(format_header,
 		"TT_SLOT_FLAG_CTRC_RELEASE_PROVEN"));
 	free(xlog_header);
@@ -1656,6 +1745,7 @@ UT_TEST(test_all_heap_dml_callers_reprepare_outside_content_lock)
 UT_TEST(test_prepared_consumer_excludes_only_cluster_undo_slow_paths)
 {
 	char *source = read_undo_record_source();
+	const char *preflight;
 	const char *consume;
 	const char *consume_end;
 	const char *forbidden[] = {
@@ -1673,21 +1763,26 @@ UT_TEST(test_prepared_consumer_excludes_only_cluster_undo_slow_paths)
 
 	if (source == NULL)
 		return;
-	consume = strstr(source, "\ncluster_undo_record_consume_prepared(");
+	preflight = strstr(source, "\ncluster_undo_record_consume_preflight(");
+	consume = preflight == NULL ? NULL
+		: strstr(preflight, "\ncluster_undo_record_consume_prepared(");
 	consume_end = consume == NULL ? NULL
 		: strstr(consume, "\n}\n\n\nUBA\ncluster_undo_record_alloc(");
+	UT_ASSERT_NOT_NULL(preflight);
 	UT_ASSERT_NOT_NULL(consume);
 	UT_ASSERT_NOT_NULL(consume_end);
-	if (consume != NULL && consume_end != NULL)
+	if (preflight != NULL && consume != NULL && consume_end != NULL)
 	{
 		for (i = 0; i < lengthof(forbidden); i++)
 		{
-			const char *hit = strstr(consume, forbidden[i]);
+			const char *hit = strstr(preflight, forbidden[i]);
 
 			UT_ASSERT(hit == NULL || hit >= consume_end);
 		}
+		UT_ASSERT_NOT_NULL(strstr(preflight,
+			"cluster_undo_buf_lock_ref_conditional("));
 		UT_ASSERT_NOT_NULL(strstr(consume,
-			"cluster_undo_record_install_prepared_resident_conditional("));
+			"cluster_undo_record_install_prepared_resident_locked("));
 	}
 	free(source);
 }
@@ -1739,6 +1834,8 @@ UT_TEST(test_prepared_receipt_retains_exact_admission_until_close)
 	const char *recheck_end;
 	const char *cancel;
 	const char *cancel_end;
+	const char *preflight;
+	const char *preflight_end;
 	const char *consume;
 	const char *consume_end;
 
@@ -1753,8 +1850,12 @@ UT_TEST(test_prepared_receipt_retains_exact_admission_until_close)
 	cancel = recheck_end;
 	cancel_end = cancel == NULL ? NULL
 		: strstr(cancel,
+			"\n}\n\n\nClusterUndoRecordConsumePreflightResult\ncluster_undo_record_consume_preflight(");
+	preflight = cancel_end;
+	preflight_end = preflight == NULL ? NULL
+		: strstr(preflight,
 			"\n}\n\n\nClusterUndoRecordConsumeResult\ncluster_undo_record_consume_prepared(");
-	consume = cancel_end;
+	consume = preflight_end;
 	consume_end = consume == NULL ? NULL
 		: strstr(consume, "\n}\n\n\nUBA\ncluster_undo_record_alloc(");
 
@@ -1764,6 +1865,8 @@ UT_TEST(test_prepared_receipt_retains_exact_admission_until_close)
 	UT_ASSERT_NOT_NULL(recheck_end);
 	UT_ASSERT_NOT_NULL(cancel);
 	UT_ASSERT_NOT_NULL(cancel_end);
+	UT_ASSERT_NOT_NULL(preflight);
+	UT_ASSERT_NOT_NULL(preflight_end);
 	UT_ASSERT_NOT_NULL(consume);
 	UT_ASSERT_NOT_NULL(consume_end);
 	if (prepare != NULL && prepare_end != NULL)
@@ -1791,16 +1894,22 @@ UT_TEST(test_prepared_receipt_retains_exact_admission_until_close)
 
 		UT_ASSERT(leave != NULL && leave < cancel_end);
 	}
+	if (preflight != NULL && preflight_end != NULL)
+	{
+		const char *exact = strstr(preflight,
+			"cluster_semantic_activation_modifier_recheck(");
+
+		UT_ASSERT(exact != NULL && exact < preflight_end);
+		UT_ASSERT(strstr(preflight,
+			"cluster_undo_record_prepare_deadline_us(") == NULL);
+	}
 	if (consume != NULL && consume_end != NULL)
 	{
-		const char *exact = strstr(consume,
-			"cluster_semantic_activation_modifier_recheck(");
 		const char *leave = strstr(consume,
 			"cluster_semantic_activation_leave(");
 		const char *enter = strstr(consume,
 			"cluster_semantic_activation_modifier_enter(");
 
-		UT_ASSERT(exact != NULL && exact < consume_end);
 		UT_ASSERT(leave != NULL && leave < consume_end);
 		UT_ASSERT(enter == NULL || enter >= consume_end);
 		UT_ASSERT(strstr(consume, "cluster_undo_record_prepare_deadline_us(")
@@ -1902,7 +2011,7 @@ UT_TEST(test_live_lifecycle_writers_use_only_exact_block0_current)
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(39);
+	UT_PLAN(36);
 
 	UT_RUN(test_record_header_roundtrip);
 	UT_RUN(test_insert_payload_roundtrip);
@@ -1930,13 +2039,10 @@ main(int argc, char **argv)
 	UT_RUN(test_reuse_wrapper_routes_only_through_exact_current_owner);
 	UT_RUN(test_record_prepare_owns_extent_and_block0_slow_paths);
 	UT_RUN(test_prepared_consumer_rechecks_exact_receipt_before_record_mutation);
-	UT_RUN(test_terminal_census_precedes_final_receipt_recheck_and_itl_allocation);
+	UT_RUN(test_prepared_consume_lock_precedes_first_receipt_apply);
 	UT_RUN(test_ctrc_cross_page_update_requires_both_prepared_receipts);
 	UT_RUN(test_heap_update_applies_required_receipts_before_undo_and_page_mutation);
 	UT_RUN(test_ctrc_release_flag_terminal_recycle_reuse_and_redo_matrix);
-	UT_RUN(test_heap_prepare_retries_transient_result_under_one_deadline);
-	UT_RUN(test_inlock_consume_preserves_retry_required_for_heap_unwind);
-	UT_RUN(test_all_heap_dml_callers_reprepare_outside_content_lock);
 	UT_RUN(test_prepared_consumer_excludes_only_cluster_undo_slow_paths);
 	UT_RUN(test_prepared_receipt_is_single_use_and_exactly_cancelable);
 	UT_RUN(test_prepared_receipt_retains_exact_admission_until_close);

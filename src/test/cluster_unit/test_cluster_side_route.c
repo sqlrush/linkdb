@@ -100,6 +100,9 @@ UT_TEST(test_route_matrix_named_rows)
 	UT_ASSERT_EQ((int) row.kind, (int) CLUSTER_SIDE_ROUTE_TT_UNDO);
 	UT_ASSERT(cluster_side_route_lookup(RM_CLUSTER_UNDO_ID, XLOG_UNDO_TT_SLOT_COMMIT, &row));
 	UT_ASSERT_EQ((int) row.kind, (int) CLUSTER_SIDE_ROUTE_TT_UNDO);
+	UT_ASSERT(cluster_side_route_lookup(RM_CLUSTER_UNDO_ID,
+		XLOG_UNDO_TT_SLOT_CTRC_RELEASE, &row));
+	UT_ASSERT_EQ((int) row.kind, (int) CLUSTER_SIDE_ROUTE_TT_UNDO);
 	UT_ASSERT(cluster_side_route_lookup(RM_CLUSTER_UNDO_ID, XLOG_HW_RESERVE, &row));
 	UT_ASSERT_EQ((int) row.kind, (int) CLUSTER_SIDE_ROUTE_BLOCKED);
 }
@@ -173,8 +176,9 @@ UT_TEST(test_route_consumes_the_exhaustive_manifest)
 	UT_ASSERT_EQ((int) side.kind, (int) CLUSTER_SIDE_ROUTE_BLOCKED);
 	UT_ASSERT(cluster_side_route_lookup(RM_GIST_ID, 0x70, &side));
 	UT_ASSERT_EQ((int) side.kind, (int) CLUSTER_SIDE_ROUTE_PROVED_NOOP);
-	UT_ASSERT(cluster_side_route_lookup(RM_CLUSTER_UNDO_ID, 0xA0, &side));
-	UT_ASSERT_EQ((int) side.kind, (int) CLUSTER_SIDE_ROUTE_BLOCKED);
+	UT_ASSERT(cluster_side_route_lookup(RM_CLUSTER_UNDO_ID,
+		XLOG_UNDO_TT_SLOT_CTRC_RELEASE, &side));
+	UT_ASSERT_EQ((int) side.kind, (int) CLUSTER_SIDE_ROUTE_TT_UNDO);
 }
 
 int

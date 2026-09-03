@@ -287,7 +287,52 @@ cluster_itl_touch_register_exact_ctrc(
 	const ClusterItlTouchHandle *handle, Buffer buffer, TransactionId xid,
 	const ClusterCtrcReceiptHandle *ctrc_handle)
 {
+	/* Every caller reaches this point only after the protected page/WAL
+	 * mutation has completed.  Record the causal ordering while the exact
+	 * receipt handle is still backend-owned. */
+	if (ctrc_handle != NULL)
+		cluster_ctrc_note_publication_after_apply(ctrc_handle, false);
 	itl_touch_register_exact_internal(handle, buffer, xid, ctrc_handle);
+}
+
+bool
+cluster_itl_touch_lookup_reusable_ctrc(
+	const ClusterItlTouchHandle *handle, Buffer buffer, TransactionId xid,
+	ClusterCtrcReceiptHandle *ctrc_handle_out)
+{
+	ClusterItlTerminalProof current;
+	uint32 range_start = 0;
+	uint32 i;
+
+	if (ctrc_handle_out != NULL)
+		MemSet(ctrc_handle_out, 0, sizeof(*ctrc_handle_out));
+	if (handle == NULL || ctrc_handle_out == NULL
+		|| handle->slot_idx >= CLUSTER_ITL_INITRANS_DEFAULT)
+		return false;
+	itl_touch_capture_proof(handle, buffer, xid, &current);
+	if (!current.valid)
+		return false;
+	if (subxact_depth > 0)
+		range_start = subxact_stack[subxact_depth - 1].start_count;
+
+	for (i = touch_count; i > range_start; i--)
+	{
+		const ClusterItlTouchRecord *existing = &touch_list[i - 1];
+
+		if (!itl_touch_handle_matches(&existing->key, handle)
+			|| !existing->ctrc_handle.valid
+			|| existing->proof.buffer_id != current.buffer_id
+			|| !cluster_itl_terminal_proof_owner_exact(
+				&existing->proof, current.own_generation,
+				current.acquisition_epoch, current.pcm_state, true, 0, 0)
+			|| !cluster_itl_terminal_proof_slot_exact(
+				&existing->proof, current.xid, current.slot_wrap,
+				current.slot_class, &current.undo_segment_head))
+			continue;
+		*ctrc_handle_out = existing->ctrc_handle;
+		return true;
+	}
+	return false;
 }
 
 void
@@ -946,6 +991,18 @@ cluster_itl_touch_register_exact_ctrc(
 	TransactionId xid pg_attribute_unused(),
 	const ClusterCtrcReceiptHandle *ctrc_handle pg_attribute_unused())
 {}
+
+bool
+cluster_itl_touch_lookup_reusable_ctrc(
+	const ClusterItlTouchHandle *handle pg_attribute_unused(),
+	Buffer buffer pg_attribute_unused(),
+	TransactionId xid pg_attribute_unused(),
+	ClusterCtrcReceiptHandle *ctrc_handle_out)
+{
+	if (ctrc_handle_out != NULL)
+		MemSet(ctrc_handle_out, 0, sizeof(*ctrc_handle_out));
+	return false;
+}
 
 void
 cluster_itl_touch_foreach(ClusterItlTouchCallback cb pg_attribute_unused(),

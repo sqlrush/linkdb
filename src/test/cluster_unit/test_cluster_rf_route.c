@@ -93,7 +93,7 @@ UT_TEST(test_route_abi_and_counts)
 {
 	UT_ASSERT_EQ(sizeof(RfOpcodeRouteV1), 8);
 	UT_ASSERT_EQ(rf_opcode_route_manifest_count_v1(), 138);
-	UT_ASSERT_EQ(rf_opcode_route_manifest_live_count_v1(), 137);
+	UT_ASSERT_EQ(rf_opcode_route_manifest_live_count_v1(), 138);
 }
 
 UT_TEST(test_route_canonical_key_stream)
@@ -172,14 +172,14 @@ UT_TEST(test_route_xact_flags_are_exact)
 		false, &route), RF_OPCODE_ROUTE_OK);
 }
 
-UT_TEST(test_route_inactive_space_row_does_not_self_activate)
+UT_TEST(test_route_ctrc_release_is_active_typed_side_record)
 {
 	RfOpcodeRouteV1 route;
 
 	UT_ASSERT_EQ(rf_opcode_route_lookup_v1(RM_CLUSTER_UNDO_ID, 0xA0,
-		true, false, &route), RF_OPCODE_ROUTE_OPCODE_UNSUPPORTED);
+		false, false, &route), RF_OPCODE_ROUTE_OK);
 	UT_ASSERT_EQ(rf_opcode_route_lookup_v1(RM_CLUSTER_UNDO_ID, 0xA0,
-		true, true, &route), RF_OPCODE_ROUTE_OK);
+		true, false, &route), RF_OPCODE_ROUTE_BLOCK_SHAPE_INVALID);
 	UT_ASSERT_EQ(route.codec_id, RF_ROUTE_CODEC_SIDE_CLUSTER_UNDO);
 }
 
@@ -232,13 +232,8 @@ UT_TEST(test_every_manifest_row_has_one_total_route)
 					expected.codec_id == RF_ROUTE_CODEC_SIDE_RAW_LAYOUT ||
 					expected.codec_id == RF_ROUTE_CODEC_SIDE_ADG_BARRIER ||
 					expected.codec_id == RF_ROUTE_CODEC_SIDE_XID_STRIPE_SHMEM);
-				if (expected.rmid == RM_CLUSTER_UNDO_ID &&
-					expected.normalized_info == 0xA0)
-					UT_ASSERT_EQ(expected.block_policy,
-						RF_ROUTE_BLOCKS_REQUIRED);
-				else
-					UT_ASSERT_EQ(expected.block_policy,
-						RF_ROUTE_BLOCKS_FORBIDDEN);
+				UT_ASSERT_EQ(expected.block_policy,
+					RF_ROUTE_BLOCKS_FORBIDDEN);
 				break;
 			case RF_ROUTE_OWNER_LOGICAL_NOOP:
 				logical_count++;
@@ -370,7 +365,7 @@ main(void)
 	UT_RUN(test_route_canonical_key_stream);
 	UT_RUN(test_route_page_and_side_block_policies);
 	UT_RUN(test_route_xact_flags_are_exact);
-	UT_RUN(test_route_inactive_space_row_does_not_self_activate);
+	UT_RUN(test_route_ctrc_release_is_active_typed_side_record);
 	UT_RUN(test_route_cluster_owners_are_not_family_defaults);
 	UT_RUN(test_every_manifest_row_has_one_total_route);
 	UT_RUN(test_every_high_nibble_is_closed);

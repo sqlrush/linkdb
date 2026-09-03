@@ -1405,6 +1405,12 @@ extern ResourceXApplyResult cluster_pcm_lock_resource_x_master_snapshot_exact(
 	const ResourceXAssertion *assertion, ResourceXMasterSnapshot *out);
 extern bool cluster_pcm_lock_resource_x_s_barrier_active_exact(
 	const BufferTag *tag);
+/* Requester-node projection of an in-flight bootstrap round.  This is a
+ * retry-only local S-admission barrier; terminal cached X remains eligible
+ * for the normal BufferDesc covering-grant path. */
+extern bool
+cluster_pcm_lock_resource_x_requester_s_barrier_active_exact(
+	const BufferTag *tag);
 extern ResourceXApplyResult
 cluster_pcm_lock_resource_x_current_x_successor_exact(
 	const BufferTag *tag, int32 holder_node, bool *preserve_current_x_out);

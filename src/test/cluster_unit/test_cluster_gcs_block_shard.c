@@ -53,6 +53,7 @@
 #include "cluster/cluster_ic_envelope.h"
 #include "cluster/cluster_lms_shard.h"
 #include "cluster/cluster_multixact_current_wire.h"
+#include "cluster/cluster_terminal_ref_census.h"
 #include "cluster/cluster_resource_x_node_wire.h"
 #include "storage/buf_internals.h"
 
@@ -621,6 +622,65 @@ UT_TEST(test_current_mx_forward128_routes_by_request_identity)
 		CLUSTER_LMS_MAX_WORKERS), -1);
 }
 
+/* MXA-T24: the 136-byte CTRC CLOSE/CERTIFICATE family must use the same
+ * request-identity route at enqueue and receive.  A malformed domain marker
+ * is unroutable, never a legacy BufferTag frame. */
+UT_TEST(test_ctrc_forward136_routes_only_exact_wire_domain)
+{
+	ClusterCtrcSealRequestV1 request;
+	BufferTag route_tag;
+	int expected;
+
+	memset(&request, 0, sizeof(request));
+	request.request_id = UINT64CONST(0x8899aabbccddeeff);
+	request.cluster_epoch = UINT64CONST(0x01020304);
+	request.original_requester_node = 2;
+	request.requester_backend_id = CLUSTER_CTRC_INTERNAL_ENDPOINT;
+	request.grant_generation = 17;
+	request.slot_wrap = 3;
+	request.owner_instance = 3;
+	request.suboperation = CTRC_SEAL_CLOSE_AND_CLEAN;
+	request.segment_generation = 9;
+	request.selector_version = CLUSTER_CTRC_SELECTOR_VERSION;
+	request.forward_kind = CLUSTER_CTRC_FORWARD_KIND;
+	request.magic = CLUSTER_CTRC_WIRE_MAGIC;
+	request.wire_version = CLUSTER_CTRC_WIRE_VERSION;
+	request.wire_length = CLUSTER_CTRC_SEAL_REQUEST_BYTES;
+	request.participant_capability_record_generation = 23;
+
+	route_tag = GcsBlockCurrentMxRouteTagMake(
+		request.request_id, request.cluster_epoch,
+		request.original_requester_node, request.requester_backend_id);
+	expected = cluster_lms_shard_for_tag(&route_tag, CLUSTER_LMS_MAX_WORKERS);
+	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(
+		PGRAC_IC_MSG_GCS_BLOCK_FORWARD, &request, sizeof(request),
+		CLUSTER_LMS_MAX_WORKERS), expected);
+
+	request.forward_kind = GCS_BLOCK_FORWARD_KIND_UNDO_FRESHREF_C1B_PAIR;
+	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(
+		PGRAC_IC_MSG_GCS_BLOCK_FORWARD, &request, sizeof(request),
+		CLUSTER_LMS_MAX_WORKERS), -1);
+	request.forward_kind = CLUSTER_CTRC_FORWARD_KIND;
+	request.wire_version++;
+	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(
+		PGRAC_IC_MSG_GCS_BLOCK_FORWARD, &request, sizeof(request),
+		CLUSTER_LMS_MAX_WORKERS), -1);
+	request.wire_version = CLUSTER_CTRC_WIRE_VERSION;
+	request.reserved_tail = 1;
+	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(
+		PGRAC_IC_MSG_GCS_BLOCK_FORWARD, &request, sizeof(request),
+		CLUSTER_LMS_MAX_WORKERS), -1);
+	request.reserved_tail = 0;
+	request.participant_capability_record_generation = 0;
+	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(
+		PGRAC_IC_MSG_GCS_BLOCK_FORWARD, &request, sizeof(request),
+		CLUSTER_LMS_MAX_WORKERS), -1);
+	request.participant_capability_record_generation = 23;
+	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(
+		PGRAC_IC_MSG_GCS_BLOCK_FORWARD, &request, sizeof(request) - 1,
+		CLUSTER_LMS_MAX_WORKERS), -1);
+}
+
 /* Every staged PCM-X frame is tag-affine.  RETIRE/RETIRE_ACK are the only
  * direct-send members because their compact payload intentionally has no tag. */
 UT_TEST(test_pi_durable_note_routes_to_exact_tag_worker)
@@ -846,7 +906,7 @@ UT_TEST(test_resource_x_length_collisions_preserve_legacy_domains)
 int
 main(void)
 {
-	UT_PLAN(15);
+	UT_PLAN(16);
 	UT_RUN(test_route_matches_shard_for_tag);
 	UT_RUN(test_route_ack_request_interleave_affinity);
 	UT_RUN(test_route_registry_partition);
@@ -859,6 +919,7 @@ main(void)
 	UT_RUN(test_r4_kind2_terminal_census_routes_to_existing_data_worker0);
 	UT_RUN(test_r4_extended_route_length_mismatch_refused);
 	UT_RUN(test_current_mx_forward128_routes_by_request_identity);
+	UT_RUN(test_ctrc_forward136_routes_only_exact_wire_domain);
 	UT_RUN(test_pi_durable_note_routes_to_exact_tag_worker);
 	UT_RUN(test_resource_x_reused_types_route_only_after_strict_domain_decode);
 	UT_RUN(test_resource_x_length_collisions_preserve_legacy_domains);

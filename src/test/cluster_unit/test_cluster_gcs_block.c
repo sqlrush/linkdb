@@ -2642,6 +2642,82 @@ UT_TEST(test_resource_x_type15_exact_join_is_the_only_new_r9_entry)
 	free(source);
 }
 
+UT_TEST(test_resource_x_duplicate_type15_tick_rearms_only_exact_buffer_busy)
+{
+	char *source = read_gcs_block_source();
+	const char *ingress;
+	const char *ingress_end;
+	const char *terminal;
+	const char *terminal_end;
+	const char *blocked;
+	const char *exact_generation;
+	const char *busy_reason;
+	const char *rearm;
+	const char *reprobe;
+	const char *try_frame;
+
+	UT_ASSERT_NOT_NULL(source);
+	if (source == NULL)
+		return;
+	try_frame = strstr(source, "\ngcs_block_try_resource_x_frame(");
+	ingress = try_frame != NULL
+		? strstr(try_frame, "case RESOURCE_X_WIRE_IMAGE_ENVELOPE:") : NULL;
+	ingress_end = ingress != NULL ? strstr(ingress, "\n\t}\n\tif (") : NULL;
+	terminal = strstr(source,
+		"\ngcs_block_pcm_x_resource_x_join_terminal_try(");
+	terminal_end = terminal != NULL
+		? strstr(terminal, "\nstatic ResourceXApplyResult\n"
+			"gcs_block_pcm_x_resource_x_master_durable_try(")
+		: NULL;
+	UT_ASSERT_NOT_NULL(ingress);
+	UT_ASSERT_NOT_NULL(ingress_end);
+	UT_ASSERT_NOT_NULL(terminal);
+	UT_ASSERT_NOT_NULL(terminal_end);
+	if (ingress != NULL && ingress_end != NULL) {
+		const char *retry_arg = strstr(ingress,
+			"result == RESOURCE_X_APPLY_DUPLICATE");
+		const char *terminal_try = strstr(ingress,
+			"gcs_block_resource_x_requester_terminal_try(");
+
+		UT_ASSERT_NOT_NULL(retry_arg);
+		UT_ASSERT_NOT_NULL(terminal_try);
+		if (retry_arg != NULL)
+			UT_ASSERT(retry_arg < ingress_end);
+		if (terminal_try != NULL)
+			UT_ASSERT(terminal_try < ingress_end);
+	}
+	if (terminal == NULL || terminal_end == NULL) {
+		free(source);
+		return;
+	}
+
+	/* A retained exact transport replay is one existing scheduled tick.  It
+	 * may clear only the same-generation, retryable content-lock BUSY
+	 * observation and make one new probe/attempt; no local loop or new timer
+	 * is allowed. */
+	blocked = strstr(terminal,
+		"probe_result == RESOURCE_X_EXECUTOR_BLOCKED");
+	exact_generation = blocked != NULL ? strstr(blocked,
+		"executor_snapshot.no_progress_generation == ref.acquisition_generation")
+		: NULL;
+	busy_reason = exact_generation != NULL ? strstr(exact_generation,
+		"executor_snapshot.no_progress_reason == RESOURCE_X_NO_PROGRESS_BUFFER_BUSY")
+		: NULL;
+	rearm = busy_reason != NULL ? strstr(busy_reason,
+		"cluster_pcm_lock_resource_x_executor_rearm_exact(&ref)") : NULL;
+	reprobe = rearm != NULL ? strstr(rearm,
+		"cluster_pcm_lock_resource_x_executor_probe_exact(") : NULL;
+	UT_ASSERT_NOT_NULL(strstr(terminal, "bool scheduled_retry"));
+	UT_ASSERT_NOT_NULL(blocked);
+	UT_ASSERT_NOT_NULL(exact_generation);
+	UT_ASSERT_NOT_NULL(busy_reason);
+	UT_ASSERT_NOT_NULL(rearm);
+	UT_ASSERT_NOT_NULL(reprobe);
+	if (reprobe != NULL)
+		UT_ASSERT(reprobe < terminal_end);
+	free(source);
+}
+
 UT_TEST(test_resource_x_direct_n_uses_exact_durable_storage_proof)
 {
 	static const char *const master_proof_contract[] = {
@@ -4311,7 +4387,15 @@ UT_TEST(test_r4_tx_origin_pending_work_uses_bounded_lms_poll_slice)
 		"cluster_gcs_block_r4_tx_resolve_wait_timeout(LMS_IDLE_TIMEOUT_MS)",
 		"cluster_lms_data_plane_tick(lms_wait_timeout_ms)"
 	};
+	static const char *const data_worker_contract[] = {
+		"cluster_gcs_block_r4_tx_resolve_drain()",
+		"cluster_gcs_block_r4_tx_resolve_wait_timeout(LMS_IDLE_TIMEOUT_MS)",
+		"cluster_lms_data_plane_tick(lms_wait_timeout_ms)"
+	};
 	char *source = read_source_path(LMS_SOURCE_PATH);
+	const char *worker_start;
+	const char *worker_end;
+	const char *worker_drain;
 
 	/* An idle worker retains its normal sleep.  A genuinely pending exact
 	 * origin context gets a bounded poll slice so the 100ms idle tick cannot
@@ -4322,6 +4406,24 @@ UT_TEST(test_r4_tx_origin_pending_work_uses_bounded_lms_poll_slice)
 	assert_ordered_in_function(
 		source, "\nLmsMain(", "\n\n/* ============================================================",
 		lms_contract, lengthof(lms_contract));
+	/* Current-MX proof requests are sharded across every DATA worker.  Each
+	 * process owns its own nonblocking origin contexts and must drive them. */
+	worker_start = strstr(source, "\nLmsWorkerMain(");
+	UT_ASSERT_NOT_NULL(worker_start);
+	worker_end = worker_start != NULL
+		? strstr(worker_start, "\n\npid_t\ncluster_lms_get_worker_pid(") : NULL;
+	UT_ASSERT_NOT_NULL(worker_end);
+	worker_drain = worker_start != NULL
+		? strstr(worker_start, data_worker_contract[0]) : NULL;
+	UT_ASSERT_NOT_NULL(worker_drain);
+	if (worker_drain != NULL && worker_end != NULL)
+	{
+		UT_ASSERT(worker_drain < worker_end);
+		assert_ordered_in_function(
+			source, "\nLmsWorkerMain(",
+			"\n\npid_t\ncluster_lms_get_worker_pid(",
+			data_worker_contract, lengthof(data_worker_contract));
+	}
 	free(source);
 }
 
@@ -4371,6 +4473,11 @@ UT_TEST(test_current_mx_member_proof_reuses_nonblocking_target_origin_context)
 		"context->current_mx_requester_identity.capability_record_generation",
 		"cluster_cr_server_current_mx_build_proof_page("
 	};
+	static const char *const send_worker_contract[] = {
+		"gcs_block_r4_tx_origin_worker_current(context)",
+		"gcs_block_current_mx_origin_prepare_reply(context)",
+		"gcs_block_send_envelope_or_loopback("
+	};
 	char *source = read_gcs_block_source();
 
 	assert_ordered_in_function(
@@ -4402,10 +4509,91 @@ UT_TEST(test_current_mx_member_proof_reuses_nonblocking_target_origin_context)
 		"\nstatic bool\ngcs_block_current_mx_origin_sample_held(",
 		capability_carrier_contract,
 		lengthof(capability_carrier_contract));
+	assert_ordered_in_function(
+		source, "\ngcs_block_r4_tx_origin_step(",
+		"\nvoid\ncluster_gcs_block_r4_tx_resolve_drain(",
+		send_worker_contract, lengthof(send_worker_contract));
 	UT_ASSERT_NULL(strstr(source,
 		"owner->segment_id != segment_id"));
 	UT_ASSERT_NULL(strstr(source,
 		"gcs_block_current_mx_origin_try_accept(env, payload)\n\t\t&& cluster_runtime_visibility_current_owner_lookup_exact"));
+	free(source);
+}
+
+UT_TEST(test_ctrc_forward_and_reply_use_closed_internal_gcs_domain)
+{
+	static const char *const dispatch_contract[] = {
+		"cluster_sf_peer_capability_generation_matches(",
+		"cluster_ctrc_seal_request_encode(",
+		"dispatch->suboperation",
+		"cluster_ctrc_origin_note_certificate_reply_shared(",
+		"cluster_lms_outbound_enqueue_cap_bound("
+	};
+	static const char *const forward_contract[] = {
+		"cluster_ctrc_seal_request_decode(",
+		"cluster_semantic_activation_enter_r4_terminal_census(",
+		"cluster_semantic_activation_resolve_shared_undo_root_r4_terminal_census(",
+		"cluster_ctrc_participant_request_shared(",
+		"cluster_ctrc_seal_reply_encode(",
+		"GCS_BLOCK_REPLY_CURRENT_MX_CTRC_SEAL_RESULT",
+		"cluster_ic_send_envelope("
+	};
+	static const char *const reply_contract[] = {
+		"cluster_ctrc_origin_request_snapshot_shared(",
+		"cluster_ctrc_seal_reply_decode(",
+		"cluster_ctrc_origin_note_certificate_reply_shared(",
+		"cluster_ctrc_origin_ack_land_shared(",
+		"cluster_ctrc_origin_note_close_reply_shared("
+	};
+	char *source = read_gcs_block_source();
+	const char *forward_handler;
+	const char *ctrc_forward_call;
+	const char *current_mx_call;
+	const char *reply_handler;
+	const char *ctrc_reply_call;
+	const char *current_mx_reply_call;
+
+	UT_ASSERT_NOT_NULL(source);
+	if (source == NULL)
+		return;
+	assert_ordered_in_function(
+		source, "\ncluster_gcs_ctrc_dispatch_close(",
+		"\nstatic bool\ngcs_block_try_land_ctrc_reply(",
+		dispatch_contract, lengthof(dispatch_contract));
+	assert_ordered_in_function(
+		source, "\ngcs_block_try_ctrc_forward136(",
+		"\nstatic bool\ngcs_block_try_current_mx_forward128(",
+		forward_contract, lengthof(forward_contract));
+	assert_ordered_in_function(
+		source, "\ngcs_block_try_land_ctrc_reply(",
+		"\n/* Current-MX statuses 27/28",
+		reply_contract, lengthof(reply_contract));
+
+	forward_handler = strstr(source,
+		"\ncluster_gcs_handle_block_forward_envelope(");
+	ctrc_forward_call = forward_handler != NULL
+		? strstr(forward_handler,
+			"gcs_block_try_ctrc_forward136(env, payload)") : NULL;
+	current_mx_call = ctrc_forward_call != NULL
+		? strstr(ctrc_forward_call,
+			"gcs_block_try_current_mx_forward128(env, payload)") : NULL;
+	UT_ASSERT_NOT_NULL(ctrc_forward_call);
+	UT_ASSERT_NOT_NULL(current_mx_call);
+	if (ctrc_forward_call != NULL && current_mx_call != NULL)
+		UT_ASSERT(ctrc_forward_call < current_mx_call);
+
+	reply_handler = strstr(source,
+		"\ncluster_gcs_handle_block_reply_envelope(");
+	ctrc_reply_call = reply_handler != NULL
+		? strstr(reply_handler,
+			"gcs_block_try_land_ctrc_reply(env, payload)") : NULL;
+	current_mx_reply_call = ctrc_reply_call != NULL
+		? strstr(ctrc_reply_call,
+			"gcs_block_try_land_current_mx_reply(env, payload)") : NULL;
+	UT_ASSERT_NOT_NULL(ctrc_reply_call);
+	UT_ASSERT_NOT_NULL(current_mx_reply_call);
+	if (ctrc_reply_call != NULL && current_mx_reply_call != NULL)
+		UT_ASSERT(ctrc_reply_call < current_mx_reply_call);
 	free(source);
 }
 
@@ -4416,7 +4604,9 @@ UT_TEST(test_current_mx_ctrc_grant_requires_same_sample_physical_active)
 {
 	static const char *const local_contract[] = {
 		"bool ctrc_physical_active = false",
-		"cluster_runtime_visibility_current_owner_sample_held(",
+		"cluster_tt_local_get_published_binding(",
+		"expected_binding = &local_binding",
+		"cluster_runtime_visibility_current_owner_sample_held_internal(",
 		"&ctrc_physical_active",
 		"ctrc_required && !ctrc_physical_active",
 		"cluster_ctrc_origin_touch_exact("
@@ -5104,6 +5294,264 @@ UT_TEST(test_resource_x_target_resamples_exact_pending_install_after_terminal_pu
 	free(source);
 }
 
+UT_TEST(test_resource_x_target_resamples_exact_pending_install_after_wait_wakeup)
+{
+	char *source = read_gcs_block_source();
+	const char *driver;
+	const char *wait_failure;
+	const char *resample_stage;
+	const char *live_snapshot;
+	const char *round_snapshot;
+	const char *terminal_exact;
+	const char *retry;
+	const char *return_result;
+
+	/* A same-node executor may publish terminal X after this follower chose
+	 * the target-install WAIT path but before its registered CV predicate is
+	 * rechecked.  STALE is retryable only after fresh BufferDesc and round
+	 * snapshots prove the exact pending(T)->terminal-X(T+1) transition. */
+	driver = source != NULL
+		? strstr(source, "\ngcs_block_resource_x_target_acquire_internal(")
+		: NULL;
+	wait_failure = driver != NULL
+		? strstr(driver,
+			"if (wait_result != RESOURCE_X_APPLY_APPLIED\n"
+			"\t\t\t\t\t&& wait_result != RESOURCE_X_APPLY_DUPLICATE)")
+		: NULL;
+	resample_stage = wait_failure != NULL
+		? strstr(wait_failure,
+			"diagnostic_stage = \"wait-terminal-resample\"")
+		: NULL;
+	live_snapshot = resample_stage != NULL
+		? strstr(resample_stage, "cluster_bufmgr_pcm_own_snapshot(")
+		: NULL;
+	round_snapshot = live_snapshot != NULL
+		? strstr(live_snapshot,
+			"cluster_pcm_lock_resource_x_bootstrap_round_failure_snapshot_exact(")
+		: NULL;
+	terminal_exact = round_snapshot != NULL
+		? strstr(round_snapshot,
+			"cluster_gcs_resource_x_target_pending_terminal_resample_exact(")
+		: NULL;
+	retry = terminal_exact != NULL
+		? strstr(terminal_exact, "continue;")
+		: NULL;
+	return_result = retry != NULL
+		? strstr(retry, "result = wait_result;")
+		: NULL;
+	UT_ASSERT_NOT_NULL(driver);
+	UT_ASSERT_NOT_NULL(wait_failure);
+	UT_ASSERT_NOT_NULL(resample_stage);
+	UT_ASSERT_NOT_NULL(live_snapshot);
+	UT_ASSERT_NOT_NULL(round_snapshot);
+	UT_ASSERT_NOT_NULL(terminal_exact);
+	UT_ASSERT_NOT_NULL(retry);
+	UT_ASSERT_NOT_NULL(return_result);
+	if (resample_stage != NULL && live_snapshot != NULL
+		&& round_snapshot != NULL && terminal_exact != NULL
+		&& retry != NULL && return_result != NULL)
+		UT_ASSERT(resample_stage < live_snapshot
+			&& live_snapshot < round_snapshot
+			&& round_snapshot < terminal_exact
+			&& terminal_exact < retry
+			&& retry < return_result);
+	free(source);
+}
+
+UT_TEST(test_resource_x_target_waits_out_unrelated_local_pending_reservation)
+{
+	ClusterPcmOwnSnapshot pending;
+	ClusterPcmOwnSnapshot live;
+	char *source;
+	const char *driver;
+	const char *pending_branch;
+	const char *retry_exact;
+	const char *retry_wait;
+	const char *generic_candidate;
+
+	memset(&pending, 0, sizeof(pending));
+	pending.tag.spcOid = 1663;
+	pending.tag.dbOid = 5;
+	pending.tag.relNumber = 16384;
+	pending.tag.forkNum = MAIN_FORKNUM;
+	pending.tag.blockNum = 224;
+	pending.pcm_state = (uint8) PCM_STATE_N;
+	pending.generation = 6;
+	pending.reservation_token = 77;
+	pending.flags = PCM_OWN_FLAG_GRANT_PENDING;
+	live = pending;
+
+	/* A concurrent local S reservation is reversible pre-mutation state.  It
+	 * may overlap an unrelated Resource-X requester round, so it is bounded
+	 * local contention rather than a reason to fence the cluster-wide gate. */
+	UT_ASSERT(cluster_gcs_resource_x_target_local_n_reservation_retry_exact(
+		&pending, CLUSTER_PCM_OWN_OK, &live,
+		UINT64_C(100), UINT64_C(200)));
+	live.reservation_token++;
+	UT_ASSERT(cluster_gcs_resource_x_target_local_n_reservation_retry_exact(
+		&pending, CLUSTER_PCM_OWN_OK, &live,
+		UINT64_C(100), UINT64_C(200)));
+	live.flags = 0;
+	UT_ASSERT(cluster_gcs_resource_x_target_local_n_reservation_retry_exact(
+		&pending, CLUSTER_PCM_OWN_OK, &live,
+		UINT64_C(100), UINT64_C(200)));
+
+	/* Invalid reservation shapes, descriptor drift, failed snapshots, and an
+	 * exhausted caller deadline never acquire or extend authority. */
+	pending.reservation_token = 0;
+	UT_ASSERT(!cluster_gcs_resource_x_target_local_n_reservation_retry_exact(
+		&pending, CLUSTER_PCM_OWN_OK, &live,
+		UINT64_C(100), UINT64_C(200)));
+	pending.reservation_token = 77;
+	pending.writer_activation_token = 77;
+	UT_ASSERT(!cluster_gcs_resource_x_target_local_n_reservation_retry_exact(
+		&pending, CLUSTER_PCM_OWN_OK, &live,
+		UINT64_C(100), UINT64_C(200)));
+	pending.writer_activation_token = 0;
+	live.tag.blockNum++;
+	UT_ASSERT(!cluster_gcs_resource_x_target_local_n_reservation_retry_exact(
+		&pending, CLUSTER_PCM_OWN_OK, &live,
+		UINT64_C(100), UINT64_C(200)));
+	live.tag = pending.tag;
+	UT_ASSERT(!cluster_gcs_resource_x_target_local_n_reservation_retry_exact(
+		&pending, CLUSTER_PCM_OWN_STALE, &live,
+		UINT64_C(100), UINT64_C(200)));
+	UT_ASSERT(!cluster_gcs_resource_x_target_local_n_reservation_retry_exact(
+		&pending, CLUSTER_PCM_OWN_OK, &live,
+		UINT64_C(200), UINT64_C(200)));
+
+	/* Production must consume this transient before the clean-N assertion
+	 * predicate sees GRANT_PENDING and maps its INVALID result to recovery. */
+	source = read_gcs_block_source();
+	driver = source != NULL
+		? strstr(source, "\ngcs_block_resource_x_target_acquire_internal(")
+		: NULL;
+	pending_branch = driver != NULL
+		? strstr(driver, "own.flags == PCM_OWN_FLAG_GRANT_PENDING")
+		: NULL;
+	retry_exact = pending_branch != NULL
+		? strstr(pending_branch,
+			"cluster_gcs_resource_x_target_local_n_reservation_retry_exact(")
+		: NULL;
+	retry_wait = retry_exact != NULL
+		? strstr(retry_exact, "diagnostic_stage = \"local-pending-reservation-wait\"")
+		: NULL;
+	generic_candidate = retry_wait != NULL
+		? strstr(retry_wait,
+			"cluster_bufmgr_pcm_own_n_assertion_candidate_exact(")
+		: NULL;
+	UT_ASSERT_NOT_NULL(driver);
+	UT_ASSERT_NOT_NULL(pending_branch);
+	UT_ASSERT_NOT_NULL(retry_exact);
+	UT_ASSERT_NOT_NULL(retry_wait);
+	UT_ASSERT_NOT_NULL(generic_candidate);
+	if (pending_branch != NULL && retry_exact != NULL
+		&& retry_wait != NULL && generic_candidate != NULL)
+		UT_ASSERT(pending_branch < retry_exact
+			&& retry_exact < retry_wait
+			&& retry_wait < generic_candidate);
+	free(source);
+}
+
+UT_TEST(test_resource_x_target_retries_clean_n_reservation_token_churn)
+{
+	ClusterPcmOwnSnapshot before;
+	ClusterPcmOwnSnapshot live;
+	char *source;
+	const char *driver;
+	const char *candidate;
+	const char *retry_exact;
+	const char *failure_record;
+
+	memset(&before, 0, sizeof(before));
+	before.tag.spcOid = 1663;
+	before.tag.dbOid = 5;
+	before.tag.relNumber = 16384;
+	before.tag.forkNum = MAIN_FORKNUM;
+	before.tag.blockNum = 224;
+	before.pcm_state = (uint8) PCM_STATE_N;
+	before.generation = 6;
+	before.reservation_token = 29;
+	live = before;
+	live.reservation_token = 30;
+
+	/* A local caller may begin and abort its reversible reservation entirely
+	 * between the driver's snapshot and clean-N shape check.  The unchanged
+	 * generation and ownership fields prove that only the monotone reservation
+	 * token advanced; retrying under the original deadline grants no authority. */
+	UT_ASSERT(cluster_gcs_resource_x_target_local_n_reservation_retry_exact(
+		&before, CLUSTER_PCM_OWN_STALE, &live,
+		UINT64_C(100), UINT64_C(200)));
+	before.reservation_token = 0;
+	UT_ASSERT(cluster_gcs_resource_x_target_local_n_reservation_retry_exact(
+		&before, CLUSTER_PCM_OWN_STALE, &live,
+		UINT64_C(100), UINT64_C(200)));
+
+	/* State, generation, ownership or non-monotone token drift is not the
+	 * completed pre-mutation reservation episode handled by this retry. */
+	before.reservation_token = 29;
+	live.reservation_token = before.reservation_token;
+	UT_ASSERT(!cluster_gcs_resource_x_target_local_n_reservation_retry_exact(
+		&before, CLUSTER_PCM_OWN_STALE, &live,
+		UINT64_C(100), UINT64_C(200)));
+	live.reservation_token = 28;
+	UT_ASSERT(!cluster_gcs_resource_x_target_local_n_reservation_retry_exact(
+		&before, CLUSTER_PCM_OWN_STALE, &live,
+		UINT64_C(100), UINT64_C(200)));
+	live.reservation_token = 30;
+	live.generation++;
+	UT_ASSERT(!cluster_gcs_resource_x_target_local_n_reservation_retry_exact(
+		&before, CLUSTER_PCM_OWN_STALE, &live,
+		UINT64_C(100), UINT64_C(200)));
+	live.generation = before.generation;
+	live.flags = PCM_OWN_FLAG_GRANT_PENDING;
+	UT_ASSERT(cluster_gcs_resource_x_target_local_n_reservation_retry_exact(
+		&before, CLUSTER_PCM_OWN_STALE, &live,
+		UINT64_C(100), UINT64_C(200)));
+	live.flags = PCM_OWN_FLAG_GRANT_PENDING | PCM_OWN_FLAG_REVOKING;
+	UT_ASSERT(!cluster_gcs_resource_x_target_local_n_reservation_retry_exact(
+		&before, CLUSTER_PCM_OWN_STALE, &live,
+		UINT64_C(100), UINT64_C(200)));
+	live.flags = 0;
+	live.writer_activation_token = 1;
+	UT_ASSERT(!cluster_gcs_resource_x_target_local_n_reservation_retry_exact(
+		&before, CLUSTER_PCM_OWN_STALE, &live,
+		UINT64_C(100), UINT64_C(200)));
+	live.writer_activation_token = 0;
+	UT_ASSERT(!cluster_gcs_resource_x_target_local_n_reservation_retry_exact(
+		&before, CLUSTER_PCM_OWN_OK, &live,
+		UINT64_C(100), UINT64_C(200)));
+	UT_ASSERT(!cluster_gcs_resource_x_target_local_n_reservation_retry_exact(
+		&before, CLUSTER_PCM_OWN_STALE, &live,
+		UINT64_C(200), UINT64_C(200)));
+
+	/* Production consumes this exact transient after the canonical candidate
+	 * reports STALE and before first-failure classification. */
+	source = read_gcs_block_source();
+	driver = source != NULL
+		? strstr(source, "\ngcs_block_resource_x_target_acquire_internal(")
+		: NULL;
+	candidate = driver != NULL
+		? strstr(driver,
+			"cluster_bufmgr_pcm_own_n_assertion_candidate_exact(")
+		: NULL;
+	retry_exact = candidate != NULL
+		? strstr(candidate,
+			"cluster_gcs_resource_x_target_local_n_reservation_retry_exact(")
+		: NULL;
+	failure_record = retry_exact != NULL
+		? strstr(retry_exact,
+			"gcs_block_resource_x_first_failure_record(")
+		: NULL;
+	UT_ASSERT_NOT_NULL(driver);
+	UT_ASSERT_NOT_NULL(candidate);
+	UT_ASSERT_NOT_NULL(retry_exact);
+	UT_ASSERT_NOT_NULL(failure_record);
+	if (candidate != NULL && retry_exact != NULL && failure_record != NULL)
+		UT_ASSERT(candidate < retry_exact && retry_exact < failure_record);
+	free(source);
+}
+
 UT_TEST(test_resource_x_target_retries_only_exact_empty_round_x_to_n_drift)
 {
 	static const char *const retry_contract[] = {
@@ -5555,10 +6003,128 @@ UT_TEST(test_recovering_denial_records_exact_master_gate_predicates)
 	free(source);
 }
 
+UT_TEST(test_resource_x_high_rate_diagnostics_are_time_sampled)
+{
+	static const char *const gcs_diagnostics[] = {
+		"Resource-X kind-9 request diagnostic",
+		"Resource-X kind-9 ACK diagnostic",
+		"Resource-X source settlement ACK diagnostic",
+		"Resource-X source settlement ACK ingress diagnostic",
+		"Resource-X install settlement diagnostic",
+		"Resource-X frame ingress diagnostic"
+	};
+	char *gcs_source = read_gcs_block_source();
+	char *pcm_source = read_source_path(PCM_LOCK_SOURCE_PATH);
+	int i;
+
+	/* These messages prove the native path in t/400, but they are emitted by
+	 * protocol workers and must not synchronously write once per successful
+	 * frame under PRE load.  Keep a process-local, bounded time sampler; error
+	 * outcomes remain unsampled at their call sites. */
+	UT_ASSERT_NOT_NULL(gcs_source);
+	UT_ASSERT_NOT_NULL(pcm_source);
+	if (gcs_source != NULL)
+	{
+		UT_ASSERT_NOT_NULL(strstr(gcs_source,
+			"GCS_BLOCK_RESOURCE_X_DIAGNOSTIC_INTERVAL_US UINT64_C(250000)"));
+		UT_ASSERT_NOT_NULL(strstr(gcs_source,
+			"gcs_block_resource_x_diagnostic_next_log_at"));
+		UT_ASSERT_NOT_NULL(strstr(gcs_source,
+			"gcs_block_resource_x_diagnostic_should_log("));
+		UT_ASSERT_NOT_NULL(strstr(gcs_source,
+			"result != RESOURCE_X_APPLY_APPLIED\n"
+			"\t\t\t&& result != RESOURCE_X_APPLY_DUPLICATE"));
+		for (i = 0; i < lengthof(gcs_diagnostics); i++)
+			UT_ASSERT_NOT_NULL(strstr(gcs_source, gcs_diagnostics[i]));
+	}
+	if (pcm_source != NULL)
+	{
+		UT_ASSERT_NOT_NULL(strstr(pcm_source,
+			"PCM_RESOURCE_X_DISPATCH_DIAGNOSTIC_INTERVAL_US UINT64_C(250000)"));
+		UT_ASSERT_NOT_NULL(strstr(pcm_source,
+			"pcm_resource_x_dispatch_diagnostic_next_log_at"));
+		UT_ASSERT_NOT_NULL(strstr(pcm_source,
+			"pcm_resource_x_dispatch_diagnostic_should_log()"));
+		UT_ASSERT_NOT_NULL(strstr(pcm_source,
+			"if (pcm_resource_x_dispatch_diagnostic_should_log())\n"
+			"\t\t\t\tereport(LOG,"));
+	}
+	free(gcs_source);
+	free(pcm_source);
+}
+
+
+/* MXA-T39: the updater challenge must enter the existing cooperative
+ * DATA -> TT -> DATA continuation.  The bounded origin context owns one
+ * absolute deadline and all terminal paths use the common guard cleanup. */
+UT_TEST(test_current_mx_updater_provenance_origin_plan_races)
+{
+	char *source = read_gcs_block_source();
+	const char *advance;
+	const char *advance_end;
+	const char *freeze;
+	const char *canonical;
+	const char *recheck;
+	const char *deadline;
+	const char *cleanup;
+
+	UT_ASSERT_NOT_NULL(source);
+	if (source == NULL)
+		return;
+	advance = strstr(source,
+		"\ngcs_block_current_mx_origin_updater_provenance_advance(");
+	advance_end = advance != NULL
+		? strstr(advance, "\nstatic GcsBlockCurrentMxAdvance\n"
+			"gcs_block_current_mx_origin_advance(")
+		: NULL;
+	freeze = advance != NULL
+		? strstr(advance,
+			"cluster_runtime_visibility_origin_plan_freeze_data_held(")
+		: NULL;
+	canonical = freeze != NULL
+		? strstr(freeze,
+			"cluster_runtime_visibility_origin_plan_sample_canonical_held(")
+		: NULL;
+	recheck = canonical != NULL
+		? strstr(canonical,
+			"cluster_runtime_visibility_origin_plan_recheck_data_held(")
+		: NULL;
+	deadline = advance != NULL
+		? strstr(advance, "gcs_block_r4_tx_origin_remaining_timeout_ms(context)")
+		: NULL;
+	cleanup = strstr(source, "\ngcs_block_r4_tx_origin_context_clear(");
+
+	UT_ASSERT_NOT_NULL(advance);
+	UT_ASSERT_NOT_NULL(advance_end);
+	UT_ASSERT_NOT_NULL(freeze);
+	UT_ASSERT_NOT_NULL(canonical);
+	UT_ASSERT_NOT_NULL(recheck);
+	UT_ASSERT_NOT_NULL(deadline);
+	UT_ASSERT_NOT_NULL(cleanup);
+	if (advance_end != NULL && freeze != NULL && canonical != NULL
+		&& recheck != NULL && deadline != NULL)
+	{
+		UT_ASSERT(freeze < canonical);
+		UT_ASSERT(canonical < recheck);
+		UT_ASSERT(recheck < advance_end);
+		UT_ASSERT(deadline < advance_end);
+	}
+	if (cleanup != NULL)
+	{
+		UT_ASSERT_NOT_NULL(strstr(cleanup,
+			"cluster_undo_block0_current_cancel(&context->guard)"));
+		UT_ASSERT_NOT_NULL(strstr(cleanup,
+			"cluster_semantic_activation_leave(&context->admission)"));
+		UT_ASSERT_NOT_NULL(strstr(cleanup,
+			"memset(context, 0, sizeof(*context))"));
+	}
+	free(source);
+}
+
 int
 main(void)
 {
-	UT_PLAN(104);
+	UT_PLAN(111);
 	UT_RUN(test_gcs_block_msg_type_enum_values_no_collision);
 	UT_RUN(test_gcs_block_payload_sizes_locked);
 	UT_RUN(test_gcs_block_request_field_offsets);
@@ -5618,6 +6184,7 @@ main(void)
 	UT_RUN(test_resource_x_kind9_ingress_is_target_native_and_no_fallback);
 	UT_RUN(test_resource_x_native_target_driver_uses_round_and_no_ticket_family);
 	UT_RUN(test_resource_x_type15_exact_join_is_the_only_new_r9_entry);
+	UT_RUN(test_resource_x_duplicate_type15_tick_rearms_only_exact_buffer_busy);
 	UT_RUN(test_resource_x_direct_n_uses_exact_durable_storage_proof);
 	UT_RUN(test_resource_x_target_x_freezes_exact_committed_generation_before_replay);
 	UT_RUN(test_resource_x_target_undrained_current_predecessor_shape);
@@ -5644,6 +6211,8 @@ main(void)
 	UT_RUN(test_r4_tx_origin_epoch_zero_is_four_node_and_session_generation_exact);
 	UT_RUN(test_r4_tx_origin_pending_work_uses_bounded_lms_poll_slice);
 	UT_RUN(test_current_mx_member_proof_reuses_nonblocking_target_origin_context);
+	UT_RUN(test_current_mx_updater_provenance_origin_plan_races);
+	UT_RUN(test_ctrc_forward_and_reply_use_closed_internal_gcs_domain);
 	UT_RUN(test_current_mx_ctrc_grant_requires_same_sample_physical_active);
 	UT_RUN(test_current_mx_origin_unknown_records_first_exact_failure_stage);
 	UT_RUN(test_r4_tx_origin_cross_segment_resolution_is_cooperative);
@@ -5656,6 +6225,9 @@ main(void)
 	UT_RUN(test_resource_x_target_rebinds_exact_same_round_install_after_snapshot_drift);
 	UT_RUN(test_resource_x_target_resamples_only_exact_terminal_install);
 	UT_RUN(test_resource_x_target_resamples_exact_pending_install_after_terminal_publish);
+	UT_RUN(test_resource_x_target_resamples_exact_pending_install_after_wait_wakeup);
+	UT_RUN(test_resource_x_target_waits_out_unrelated_local_pending_reservation);
+	UT_RUN(test_resource_x_target_retries_clean_n_reservation_token_churn);
 	UT_RUN(test_resource_x_target_retries_only_exact_empty_round_x_to_n_drift);
 	UT_RUN(test_resource_x_target_waits_only_exact_retained_predecessor_after_cached_x_drift);
 	UT_RUN(test_resource_x_direct_init_reprobes_exact_same_round_after_candidate_drift);
@@ -5663,6 +6235,7 @@ main(void)
 	UT_RUN(test_resource_x_target_eviction_freezes_before_local_n_and_publishes_same_bytes);
 	UT_RUN(test_resource_x_target_waits_for_exact_post_release_settlement_window);
 	UT_RUN(test_recovering_denial_records_exact_master_gate_predicates);
+	UT_RUN(test_resource_x_high_rate_diagnostics_are_time_sampled);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

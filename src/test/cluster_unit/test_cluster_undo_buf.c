@@ -192,6 +192,7 @@ int cluster_undo_writeback_boundary_check = CLUSTER_UNDO_WB_CHECK_ON;
  */
 static uint32 ut_wait_event_info_storage = 0;
 uint32 *my_wait_event_info = &ut_wait_event_info_storage;
+int InterruptHoldoffCount = 0;
 
 /* ----- single-node latch: cluster_conf_has_peers() reads ClusterConfShmem;
  * NULL => no peers => latch does not block write-back (U1-U6 are single-node). */
@@ -215,6 +216,9 @@ ShmemInitStruct(const char *name pg_attribute_unused(), Size size, bool *foundPt
 }
 
 /* ----- LWLock stubs (single-threaded test) ----- */
+static LWLock *undo_test_conditionally_held_lock = NULL;
+static bool undo_test_conditional_acquire_allowed = true;
+
 void
 LWLockInitialize(LWLock *lock pg_attribute_unused(), int tranche_id pg_attribute_unused())
 {}
@@ -224,8 +228,25 @@ LWLockAcquire(LWLock *lock pg_attribute_unused(), LWLockMode mode pg_attribute_u
 	return true;
 }
 void
-LWLockRelease(LWLock *lock pg_attribute_unused())
-{}
+LWLockRelease(LWLock *lock)
+{
+	if (undo_test_conditionally_held_lock == lock)
+		undo_test_conditionally_held_lock = NULL;
+}
+bool
+LWLockConditionalAcquire(LWLock *lock, LWLockMode mode pg_attribute_unused())
+{
+	if (!undo_test_conditional_acquire_allowed
+		|| undo_test_conditionally_held_lock != NULL)
+		return false;
+	undo_test_conditionally_held_lock = lock;
+	return true;
+}
+bool
+LWLockHeldByMe(LWLock *lock)
+{
+	return undo_test_conditionally_held_lock == lock;
+}
 
 void
 cluster_shmem_register_region(const ClusterShmemRegion *region pg_attribute_unused())
@@ -384,6 +405,8 @@ fresh_pool(void)
 	}
 	smgr_read_calls = smgr_write_calls = smgr_fsync_write_calls = 0;
 	smgr_last_write_fsync = true;
+	undo_test_conditionally_held_lock = NULL;
+	undo_test_conditional_acquire_allowed = true;
 	cluster_undo_buf_shmem_init();
 }
 
@@ -503,6 +526,41 @@ UT_TEST(test_undo_buf_copy_resident_never_fills_on_miss)
 	UT_ASSERT(!cluster_undo_buf_copy_resident(7, 0, 0, copied));
 	UT_ASSERT_EQ((int)(unsigned char)copied[0], 0xa5);
 	UT_ASSERT_EQ(smgr_read_calls, 0);
+}
+
+
+/* A heap caller may not wait for the undo DATA content lock.  Contention must
+ * be reported before CTRC APPLY; after an exact conditional lock succeeds,
+ * the prepared image is installed through that held lock and remains visible
+ * in the same resident slot. */
+UT_TEST(test_undo_buf_prepared_consume_lock_window)
+{
+	ClusterUndoBufPin pin;
+	char successor[BLCKSZ];
+	char copied[BLCKSZ];
+	char *img;
+	int ref_slot;
+
+	fresh_pool();
+	img = cluster_undo_buf_pin(9, 0, 7, CLUSTER_UNDO_BUF_SHARED, &pin);
+	UT_ASSERT_NOT_NULL(img);
+	ref_slot = pin.slot;
+	cluster_undo_buf_addref(&pin);
+	cluster_undo_buf_unpin(&pin);
+
+	undo_test_conditional_acquire_allowed = false;
+	UT_ASSERT(!cluster_undo_buf_lock_ref_conditional(ref_slot, 9, 0, 7));
+	undo_test_conditional_acquire_allowed = true;
+	UT_ASSERT(!cluster_undo_buf_lock_ref_conditional(ref_slot, 9, 0, 8));
+	UT_ASSERT(cluster_undo_buf_lock_ref_conditional(ref_slot, 9, 0, 7));
+
+	memset(successor, 0x6d, sizeof(successor));
+	cluster_undo_buf_install_ref_locked(ref_slot, 9, 0, 7, successor);
+	cluster_undo_buf_unlock_ref(ref_slot);
+	memset(copied, 0, sizeof(copied));
+	UT_ASSERT(cluster_undo_buf_copy_resident(9, 0, 7, copied));
+	UT_ASSERT_EQ(memcmp(copied, successor, sizeof(copied)), 0);
+	cluster_undo_buf_unref_slot(ref_slot);
 }
 
 
@@ -840,6 +898,7 @@ main(void)
 	UT_RUN(test_undo_buf_block0_not_poolable);
 	UT_RUN(test_undo_buf_miss_then_hit);
 	UT_RUN(test_undo_buf_copy_resident_never_fills_on_miss);
+	UT_RUN(test_undo_buf_prepared_consume_lock_window);
 	UT_RUN(test_undo_buf_region_keeps_data_and_block0_frame_capacity_separate);
 	UT_RUN(test_undo_buf_disable_detaches_block0_frame_bank);
 	UT_RUN(test_undo_buf_write_through);

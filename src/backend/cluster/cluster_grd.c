@@ -6685,7 +6685,8 @@ static bool cluster_grd_hashremove_if_still_empty(const ClusterResId *resid);
  *	dropped first (spec-4.6 P0#3 window guard: a grant reply echoing a stale
  *	tuple would be rejected and leak a zombie grant).  Returns the number of
  *	granted identities (each tagged REQUEST or CONVERT) for the caller to route,
- *	or -1 when the exact holder is absent and no release occurred.
+ *	CLUSTER_GRD_RELEASE_NOT_FOUND when the exact holder is absent and no release
+ *	occurred, or CLUSTER_GRD_RELEASE_NOT_READY when GRD authority is unavailable.
  */
 int
 cluster_grd_release_and_drain(const ClusterResId *resid, const ClusterGrdHolderId *holder,
@@ -6704,7 +6705,9 @@ cluster_grd_release_and_drain(const ClusterResId *resid, const ClusterGrdHolderI
 
 	lookup_result = cluster_grd_entry_lookup_or_create(resid, false, &entry);
 	if (lookup_result != CLUSTER_GRD_ENTRY_OK || entry == NULL)
-		return -1;
+		return lookup_result == CLUSTER_GRD_ENTRY_NOT_FOUND
+			? CLUSTER_GRD_RELEASE_NOT_FOUND
+			: CLUSTER_GRD_RELEASE_NOT_READY;
 
 	SpinLockAcquire(&entry->lock);
 
@@ -6726,7 +6729,7 @@ cluster_grd_release_and_drain(const ClusterResId *resid, const ClusterGrdHolderI
 	if (!holder_removed) {
 		SpinLockRelease(&entry->lock);
 		cluster_grd_entry_release(entry);
-		return -1;
+		return CLUSTER_GRD_RELEASE_NOT_FOUND;
 	}
 
 	/* (2) Drop stale-epoch converts and waiters before granting. */
@@ -8184,8 +8187,10 @@ cluster_grd_release_holder_by_id(const ClusterResId *resid, const ClusterGrdHold
 	Assert(resid != NULL && holder != NULL);
 
 	er = cluster_grd_entry_lookup_or_create(resid, false, &entry);
-	if (er != CLUSTER_GRD_ENTRY_OK || entry == NULL)
-		return CLUSTER_GRD_ENTRY_NOT_FOUND;
+	if (er != CLUSTER_GRD_ENTRY_OK)
+		return er;
+	if (entry == NULL)
+		return CLUSTER_GRD_ENTRY_ERROR;
 
 	SpinLockAcquire(&entry->lock);
 	er = cluster_grd_entry_release_holder(entry, holder);

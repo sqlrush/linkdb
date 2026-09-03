@@ -72,10 +72,19 @@
 
 #include "fmgr.h"
 #include "funcapi.h"
+#include "cluster/cluster_terminal_ref_census.h"
 #include "utils/elog.h"
 #include "utils/memutils.h"
 
 char *cluster_injection_points = NULL; /* extern from cluster_guc.h */
+
+bool
+cluster_ctrc_test_barrier_control(
+	ClusterCtrcTestBarrierPhase phase pg_attribute_unused(),
+	bool armed pg_attribute_unused())
+{
+	return true;
+}
 
 static int last_elevel = -1;
 static int last_sleep_us = -1;

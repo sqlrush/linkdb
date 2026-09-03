@@ -814,6 +814,8 @@ cluster_bufmgr_pcm_x_ordinary_content_write_permitted(BufferDesc *buf)
 	return permitted;
 }
 
+PGRAC_PCM_X_FENCE_TERMINAL_OWNER(T2_INSTALL, ref,
+	cluster_pcm_x_resource_x_t2_snapshot_exact)
 ResourceXBufferActivationResult
 cluster_bufmgr_pcm_own_activate_x_by_tag(const ResourceXAcquisitionRef *ref,
 										 const ResourceXCurrentImage *image,
@@ -927,7 +929,7 @@ cluster_bufmgr_pcm_own_activate_x_by_tag(const ResourceXAcquisitionRef *ref,
 			{
 				memcpy(previous.data, page, BLCKSZ);
 				memcpy(page, image->page_bytes, BLCKSZ);
-				PageSetLSN(page, image->page_lsn);
+				PageSetLSNPreserveOrigin(page, image->page_lsn);
 				((PageHeader) page)->pd_block_scn = image->page_scn;
 				own_result = cluster_pcm_own_resource_x_activation_bind_exact(
 					buf->buf_id, live.generation, live.reservation_token,
@@ -1225,8 +1227,6 @@ cluster_bufmgr_pcm_own_direct_init_sidecar_by_tag_exact(
 	return result;
 }
 
-PGRAC_PCM_X_FENCE_TERMINAL_OWNER(T2_DIRECT_INIT_BIND, ref,
-	cluster_pcm_x_resource_x_t2_snapshot_exact)
 ResourceXBufferActivationResult
 cluster_bufmgr_pcm_own_direct_init_bind_x_by_tag_exact(
 	const ResourceXAcquisitionRef *ref, uint64 expected_generation,
@@ -1237,8 +1237,6 @@ cluster_bufmgr_pcm_own_direct_init_bind_x_by_tag_exact(
 		out_proof, NULL);
 }
 
-PGRAC_PCM_X_FENCE_TERMINAL_OWNER(T3_DIRECT_INIT_CLEAR, ref,
-	cluster_pcm_x_resource_x_t3_snapshot_exact)
 ResourceXBufferActivationResult
 cluster_bufmgr_pcm_own_direct_init_clear_x_by_tag_exact(
 	const ResourceXAcquisitionRef *ref, uint64 expected_generation,
@@ -2360,6 +2358,40 @@ cluster_bufmgr_pcm_begin_grant_reservation_wait(BufferDesc *buf, PcmLockMode req
 	{
 		result = cluster_pcm_own_begin_grant_reservation(buf, requested_mode, base_out,
 										 token_out, covered_out);
+		/* Preserve the header-locked cached-X cover check above.  If an S
+		 * caller instead published a reversible reservation while either the
+		 * canonical Resource-X head or this node's requester round was active,
+		 * withdraw that one exact token and park without minting replacements.
+		 * T1 can then observe clean N and publish X; the next begin consumes
+		 * that terminal cached cover. */
+		if (result == CLUSTER_PCM_OWN_OK && !*covered_out
+			&& requested_mode == PCM_LOCK_MODE_S
+			&& cluster_gcs_block_resource_x_local_s_barrier_active(buf->tag))
+		{
+			ClusterPcmOwnResult abort_result;
+
+			abort_result = cluster_pcm_own_abort_grant_reservation(
+				buf, base_out, *token_out);
+			if (abort_result != CLUSTER_PCM_OWN_OK
+				&& abort_result != CLUSTER_PCM_OWN_STALE)
+				cluster_pcm_own_report_bump_failure(
+					buf, abort_result, base_out->generation,
+					base_out->flags,
+					"Resource-X local S barrier reservation abort");
+			*token_out = 0;
+			result = CLUSTER_PCM_OWN_BUSY;
+			do
+			{
+				if (!cluster_bufmgr_resource_x_wait_retry(
+						BufferDescriptorGetContentLock(buf), buf->buf_id,
+						waits, barrier_refused))
+					return result;
+				if (waits < PG_UINT32_MAX)
+					waits++;
+			} while (cluster_gcs_block_resource_x_local_s_barrier_active(
+				buf->tag));
+			continue;
+		}
 		if (result != CLUSTER_PCM_OWN_BUSY)
 			return result;
 		if (!cluster_bufmgr_resource_x_wait_retry(
@@ -2557,7 +2589,8 @@ cluster_bufmgr_pcm_x_writer_prepare_target(
 	BufferDesc *buf, const BufferTag *expected_resource,
 	PcmLockMode mode, uint64 r4_generation,
 	uint64 *absolute_deadline_us,
-	bool *pcm_barrier_refused)
+	bool *pcm_barrier_refused,
+	bool *pcm_x_transient_refused)
 {
 	ClusterPcmXWriterLedgerEntry *entry;
 	ClusterPcmOwnSnapshot granted;
@@ -2618,6 +2651,18 @@ cluster_bufmgr_pcm_x_writer_prepare_target(
 				&& pcm_barrier_refused != NULL)
 			{
 				*pcm_barrier_refused = true;
+				return NULL;
+			}
+			/* BAD_STATE/NOT_FOUND and stale authority here are the acquisition
+			 * routine's pre-content-X retry surface.  Only an explicitly
+			 * retry-aware caller may consume them without ERROR, and only after
+			 * this call's process-local writer ledger has been cleared. */
+			if ((result == RESOURCE_X_APPLY_BAD_STATE
+				|| result == RESOURCE_X_APPLY_NOT_FOUND
+				|| result == RESOURCE_X_APPLY_STALE)
+				&& pcm_x_transient_refused != NULL)
+			{
+				*pcm_x_transient_refused = true;
 				return NULL;
 			}
 			cluster_bufmgr_resource_x_writer_report_failure(
@@ -9766,7 +9811,8 @@ ClusterObserveBufferBarrierReceipt(ClusterBufferBarrierSiteId site_id,
 static void
 LockBufferInternal(Buffer buffer, int mode, bool *pcm_barrier_refused,
 				   const ClusterBufferBarrierSiteId *barrier_site_id,
-				   bool *pcm_pin_replaced)
+				   bool *pcm_pin_replaced,
+				   bool *pcm_x_transient_refused)
 {
 	BufferDesc *buf;
 #ifdef USE_PGRAC_CLUSTER
@@ -9793,6 +9839,8 @@ LockBufferInternal(Buffer buffer, int mode, bool *pcm_barrier_refused,
 
 	if (pcm_pin_replaced != NULL)
 		*pcm_pin_replaced = false;
+	if (pcm_x_transient_refused != NULL)
+		*pcm_x_transient_refused = false;
 	Assert(BufferIsPinned(buffer));
 	if (BufferIsLocal(buffer))
 		return;
@@ -9853,8 +9901,11 @@ LockBufferInternal(Buffer buffer, int mode, bool *pcm_barrier_refused,
 					buf, &pcm_expected_resource, pcm_mode,
 					pcm_writer_r4_generation,
 					&pcm_x_absolute_deadline_us,
-					pcm_barrier_refused);
-				if (pcm_barrier_refused != NULL && *pcm_barrier_refused)
+					pcm_barrier_refused,
+					pcm_x_transient_refused);
+				if ((pcm_barrier_refused != NULL && *pcm_barrier_refused)
+					|| (pcm_x_transient_refused != NULL
+						&& *pcm_x_transient_refused))
 					goto cluster_lockbuffer_barrier_refusal;
 				if (pcm_x_writer == NULL)
 					cluster_bufmgr_resource_x_writer_report_failure(
@@ -10077,6 +10128,19 @@ cluster_lockbuffer_barrier_refusal:
 		&& !cluster_bufmgr_pcm_aux_pin_handoff_finish_exact(
 			buf, &pcm_aux_pin_handoff))
 	{
+		/* VM/FSM descriptors are intentionally unpinned while Resource-X
+		 * waits.  Reuse in that interval is pre-mutation drift: an explicit
+		 * replacement-aware caller discards the stale numeric Buffer and
+		 * restarts through its relation-level pin path. */
+		if (pcm_pin_replaced != NULL)
+		{
+			pcm_aux_pin_handoff.active = false;
+			*pcm_pin_replaced = true;
+			Assert(pcm_x_writer == NULL);
+			Assert(!pcm_pending_set);
+			Assert(!pcm_acquired);
+			return;
+		}
 		cluster_bufmgr_resource_x_fail_closed_current();
 		cluster_bufmgr_resource_x_writer_report_failure(
 			RESOURCE_X_APPLY_STALE, buf,
@@ -10109,31 +10173,62 @@ cluster_lockbuffer_barrier_refusal:
 void
 LockBuffer(Buffer buffer, int mode)
 {
-	LockBufferInternal(buffer, mode, NULL, NULL, NULL);
+	LockBufferInternal(buffer, mode, NULL, NULL, NULL, NULL);
 }
 
 /*
  * PGRAC (t/400 L3 item 3): EXCLUSIVE LockBuffer that reports a nested-guard
  * BARRIER_CLOSED refusal instead of raising a client ERROR.
  *
- * Returns true with the content lock held (every non-barrier path behaves
- * exactly like LockBuffer, including its error surface).  Returns false with
- * NOTHING held when the PCM-X queue acquire refused because this backend
+ * Returns true with the content lock held.  Returns false with NOTHING held
+ * when the PCM-X queue acquire refused because this backend
  * already holds another content lock whose tag sits under a frozen revoke
  * barrier: sleeping here could deadlock across locks and the frozen barrier
  * snapshot cannot see the nested edge.  The caller — the owner of that outer
  * content lock — must release its own lock(s), resolve the map-page
  * conversion while holding no content lock, and re-enter a requalify point.
+ * Pre-mutation BAD_STATE/NOT_FOUND/STALE uses that same caller-owned retry;
+ * pin_replaced distinguishes a VM/FSM descriptor reuse so the caller never
+ * dereferences or releases the stale numeric handle.
  */
 bool
 ClusterLockBufferExclusiveBarrierAware(Buffer buffer,
-									   ClusterBufferBarrierSiteId site_id)
+									   ClusterBufferBarrierSiteId site_id,
+									   bool *pin_replaced)
 {
 	bool		barrier_refused = false;
+	bool		replaced = false;
+	bool		transient_refused = false;
+
+	if (pin_replaced != NULL)
+		*pin_replaced = false;
+	LockBufferInternal(buffer, BUFFER_LOCK_EXCLUSIVE, &barrier_refused,
+		&site_id, &replaced, &transient_refused);
+	if (pin_replaced != NULL)
+		*pin_replaced = replaced;
+	return !barrier_refused && !transient_refused && !replaced;
+}
+
+/*
+ * Resource-X aware EXCLUSIVE lock for a pass-based auxiliary worker.
+ *
+ * False is a clean, pre-content-lock retry: either the gate/selector closed
+ * or target acquisition returned BAD_STATE/NOT_FOUND/STALE after its local
+ * writer ledger was cleared.  The common refusal epilogue proves that this
+ * call owns no content lock, pending grant or writer entry.  The caller still
+ * owns its original buffer pin and must release it before returning to its
+ * next pass.  Recovery-blocked state, invalid input and cleanup/invariant
+ * failures retain the ordinary ERROR surface.
+ */
+bool
+ClusterLockBufferExclusiveRetryAware(Buffer buffer)
+{
+	bool		barrier_refused = false;
+	bool		transient_refused = false;
 
 	LockBufferInternal(buffer, BUFFER_LOCK_EXCLUSIVE, &barrier_refused,
-		&site_id, NULL);
-	return !barrier_refused;
+		NULL, NULL, &transient_refused);
+	return !barrier_refused && !transient_refused;
 }
 
 /*
@@ -10151,7 +10246,8 @@ ClusterLockBufferShareBarrierAware(Buffer buffer)
 {
 	bool		barrier_refused = false;
 
-	LockBufferInternal(buffer, BUFFER_LOCK_SHARE, &barrier_refused, NULL, NULL);
+	LockBufferInternal(buffer, BUFFER_LOCK_SHARE, &barrier_refused, NULL, NULL,
+		NULL);
 	return !barrier_refused;
 }
 
@@ -10191,7 +10287,7 @@ LockBufferForAuxiliaryPageInit(Buffer buffer, ClusterPcmDirectInitKind kind)
 			if (arm_result == CLUSTER_BUFMGR_PCM_DIRECT_INIT_CACHED_X)
 			{
 				LockBufferInternal(buffer, BUFFER_LOCK_EXCLUSIVE,
-					NULL, NULL, &pin_replaced);
+					NULL, NULL, &pin_replaced, NULL);
 				return pin_replaced ? InvalidBuffer : buffer;
 			}
 			if (arm_result == CLUSTER_BUFMGR_PCM_DIRECT_INIT_JOIN_PENDING)
@@ -12025,7 +12121,7 @@ cluster_bufmgr_finish_direct_land_target_for_gcs(BufferDesc *buf, bool valid,
 		Page		page = (Page) BufHdrGetBlock(buf);
 
 		LWLockAcquire(content_lock, LW_EXCLUSIVE);
-		PageSetLSN(page, page_lsn);
+		PageSetLSNPreserveOrigin(page, page_lsn);
 		LWLockRelease(content_lock);
 		TerminateBufferIO(buf, false, BM_VALID);
 	}

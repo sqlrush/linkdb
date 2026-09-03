@@ -323,6 +323,16 @@ cluster_ic_send_envelope_fanout(uint8 msg_type pg_attribute_unused(),
 	}
 }
 
+/* Retry leg companion to the fanout stub above. */
+ClusterICSendResult
+cluster_ic_send_envelope(uint8 msg_type pg_attribute_unused(),
+						 int32 dest_node_id pg_attribute_unused(),
+						 const void *payload pg_attribute_unused(),
+						 uint32 payload_len pg_attribute_unused())
+{
+	return CLUSTER_IC_SEND_DONE;
+}
+
 int
 cluster_cssd_get_alive_peer_count(void)
 {

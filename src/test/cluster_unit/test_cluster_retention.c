@@ -202,6 +202,46 @@ UT_TEST(test_u5_peer_mode_segment_with_aborted_slot_retained)
 					 &hdr, mk_scn(10), false), 1);
 	UT_ASSERT_EQ((int)cluster_undo_segment_recyclable_for_mode(
 					 &hdr, mk_scn(10), true), 0);
+
+	/* L12 opens only after the canonical release bit is durable. */
+	hdr.tt_slots[0].xid = (TransactionId)100;
+	hdr.tt_slots[0].wrap = 1;
+	hdr.tt_slots[0].flags = TT_SLOT_FLAG_CTRC_RELEASE_PROVEN;
+	hdr.tt_slots[0].commit_scn = InvalidScn;
+	UT_ASSERT_EQ((int)cluster_undo_segment_recyclable_for_mode(
+					 &hdr, InvalidScn, true), 1);
+}
+
+UT_TEST(test_u5_peer_mode_segment_requires_release_for_every_terminal_slot)
+{
+	UndoSegmentHeaderData hdr;
+
+	init_header(&hdr, SEGMENT_COMMITTED);
+	set_committed_slot(&hdr, 0, mk_scn(7));
+	hdr.tt_slots[0].xid = (TransactionId)100;
+	hdr.tt_slots[0].wrap = 1;
+
+	/* Horizon without release proof retains. */
+	UT_ASSERT_EQ((int)cluster_undo_segment_recyclable_for_mode(
+					 &hdr, mk_scn(10), true), 0);
+	hdr.tt_slots[0].flags = TT_SLOT_FLAG_CTRC_RELEASE_PROVEN;
+	UT_ASSERT_EQ((int)cluster_undo_segment_recyclable_for_mode(
+					 &hdr, mk_scn(10), true), 1);
+
+	/* 8.4D L11 defines the folded floor as inclusive. */
+	hdr.tt_slots[0].commit_scn = mk_scn(10);
+	UT_ASSERT_EQ((int)cluster_undo_segment_recyclable_for_mode(
+					 &hdr, mk_scn(10), true), 1);
+
+	/* Unknown flag bits and a release bit on a nonterminal slot both retain. */
+	hdr.tt_slots[0].flags |= UINT8_C(0x80);
+	UT_ASSERT_EQ((int)cluster_undo_segment_recyclable_for_mode(
+					 &hdr, mk_scn(10), true), 0);
+	hdr.tt_slots[0].status = TT_SLOT_UNUSED;
+	hdr.tt_slots[0].flags = TT_SLOT_FLAG_CTRC_RELEASE_PROVEN;
+	hdr.tt_slots[0].commit_scn = InvalidScn;
+	UT_ASSERT_EQ((int)cluster_undo_segment_recyclable_for_mode(
+					 &hdr, mk_scn(10), true), 0);
 }
 
 UT_TEST(test_u5_segment_committed_invalid_commit_scn_retained)
@@ -501,6 +541,7 @@ main(void)
 	UT_RUN(test_u5_segment_committed_watermark_at_or_above_horizon);
 	UT_RUN(test_u5_segment_committed_no_committed_slot_recyclable);
 	UT_RUN(test_u5_peer_mode_segment_with_aborted_slot_retained);
+	UT_RUN(test_u5_peer_mode_segment_requires_release_for_every_terminal_slot);
 	UT_RUN(test_u5_segment_committed_invalid_commit_scn_retained);
 	UT_RUN(test_u8_segment_invalid_horizon_recyclable);
 	UT_RUN(test_u10_segment_non_committed_state_never_recyclable);

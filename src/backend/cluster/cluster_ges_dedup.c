@@ -295,6 +295,31 @@ cluster_ges_dedup_record_reply(const ClusterGesDedupKey *key, const uint8 *reply
 	LWLockRelease(cluster_ges_dedup_lock);
 }
 
+bool
+cluster_ges_dedup_remove_completed(const ClusterGesDedupKey *key)
+{
+	ClusterGesDedupEntry *entry;
+	bool found;
+	bool removed = false;
+
+	Assert(key != NULL);
+	if (cluster_ges_dedup_htab == NULL || cluster_ges_dedup_lock == NULL)
+		return false;
+
+	LWLockAcquire(cluster_ges_dedup_lock, LW_EXCLUSIVE);
+	entry = (ClusterGesDedupEntry *)hash_search(cluster_ges_dedup_htab, key,
+											HASH_FIND, &found);
+	if (found && entry != NULL && entry->cached_reply_len > 0) {
+		(void)hash_search(cluster_ges_dedup_htab, key, HASH_REMOVE, &found);
+		Assert(found);
+		pg_atomic_fetch_sub_u32(&cluster_ges_dedup_shared->entry_count, 1);
+		removed = true;
+	}
+	LWLockRelease(cluster_ges_dedup_lock);
+
+	return removed;
+}
+
 uint32
 cluster_ges_dedup_drop_stale_entries(void)
 {

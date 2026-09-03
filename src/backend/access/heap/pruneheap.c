@@ -28,6 +28,12 @@
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_mode.h"
+#include "cluster/cluster_mxid_stripe.h"
+#include "cluster/cluster_terminal_ref_census.h"
+#endif
+
 /* Working data for heap_page_prune and subroutines */
 typedef struct
 {
@@ -91,6 +97,37 @@ static void heap_prune_record_redirect(PruneState *prstate,
 static void heap_prune_record_dead(PruneState *prstate, OffsetNumber offnum);
 static void heap_prune_record_unused(PruneState *prstate, OffsetNumber offnum);
 static void page_verify_redirects(Page page);
+
+#ifdef USE_PGRAC_CLUSTER
+static bool
+heap_page_has_current_mx_predecessor(Page page)
+{
+	OffsetNumber offnum;
+	OffsetNumber maxoff;
+
+	if (!cluster_peer_mode_enabled())
+		return false;
+	maxoff = PageGetMaxOffsetNumber(page);
+	for (offnum = FirstOffsetNumber;
+		 offnum <= maxoff;
+		 offnum = OffsetNumberNext(offnum))
+	{
+		ItemId itemid = PageGetItemId(page, offnum);
+		HeapTupleHeader tuple;
+
+		if (!ItemIdIsNormal(itemid))
+			continue;
+		tuple = (HeapTupleHeader) PageGetItem(page, itemid);
+		if ((tuple->t_infomask & HEAP_XMAX_IS_MULTI) != 0
+			&& !cluster_ctrc_native_current_mx_mutation_allowed(
+				true,
+				cluster_mxid_origin_slot(
+					(MultiXactId) HeapTupleHeaderGetRawXmax(tuple))))
+			return true;
+	}
+	return false;
+}
+#endif
 
 
 /*
@@ -307,6 +344,19 @@ heap_page_prune(Relation relation, Buffer buffer,
 
 	maxoff = PageGetMaxOffsetNumber(page);
 	tup.t_tableOid = RelationGetRelid(prstate.rel);
+
+#ifdef USE_PGRAC_CLUSTER
+	/* Pruning can remove a tuple or HOT predecessor.  A current-MX tuple is
+	 * left byte-for-byte intact until CTRC cleanout has installed a successor
+	 * descriptor/terminal projection and discharged the exact old target. */
+	if (heap_page_has_current_mx_predecessor(page))
+	{
+		*nnewlpdead = 0;
+		if (off_loc != NULL)
+			*off_loc = InvalidOffsetNumber;
+		return 0;
+	}
+#endif
 
 	/*
 	 * Determine HTSV for all tuples.

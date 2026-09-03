@@ -1276,6 +1276,8 @@ LmsWorkerMain(int worker_id)
 	 * proc_exit(0) completes cleanly.
 	 */
 	for (;;) {
+		long lms_wait_timeout_ms;
+
 		CHECK_FOR_INTERRUPTS();
 
 		if (ConfigReloadPending) {
@@ -1290,6 +1292,13 @@ LmsWorkerMain(int worker_id)
 			break;
 
 		if (cluster_lms_data_plane_enabled()) {
+			/* Current-MX proof requests are sharded by request identity.  The
+			 * origin FSM is process-local, so every DATA worker must advance
+			 * the contexts accepted on its own channel without blocking that
+			 * channel on SCUR acquisition or release. */
+			cluster_gcs_block_r4_tx_resolve_drain();
+			lms_wait_timeout_ms
+				= cluster_gcs_block_r4_tx_resolve_wait_timeout(LMS_IDLE_TIMEOUT_MS);
 			/* spec-7.3 D4 — drain this worker's outbound ring (backends
 			 * staged REQUEST/FORWARD/INVALIDATE for our shard), then service
 			 * the mesh.  REPLY / INVALIDATE-ACK for blocks we received are
@@ -1299,7 +1308,7 @@ LmsWorkerMain(int worker_id)
 			/* GCS serve-stall round-5 A2 — retry PINNED invalidate
 			 * directives parked by this worker's dispatch handler. */
 			cluster_gcs_block_invalidate_park_tick();
-			cluster_lms_data_plane_tick(LMS_IDLE_TIMEOUT_MS);
+			cluster_lms_data_plane_tick(lms_wait_timeout_ms);
 		} else {
 			(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
 							LMS_IDLE_TIMEOUT_MS, WAIT_EVENT_PG_SLEEP);

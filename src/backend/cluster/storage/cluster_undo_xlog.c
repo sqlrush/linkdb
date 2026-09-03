@@ -54,6 +54,7 @@
 #include "cluster/storage/cluster_shared_fs.h"	/* undo shared-root dir resolve (D2-2) */
 #include "cluster/storage/cluster_undo_alloc.h" /* path resolve + intent (3.13 reuse redo) */
 #include "cluster/storage/cluster_undo_buf.h"	/* spec-3.18 D2b write-back gate */
+#include "cluster/cluster_undo_smgr.h"			/* exact block-0 CTRC release RMW */
 #include "cluster/storage/cluster_undo_xlog.h"
 #include "common/file_perm.h" /* pg_mkdir_p / pg_dir_create_mode (shared subdir, D2-2) */
 #include "miscadmin.h"
@@ -433,6 +434,44 @@ cluster_undo_emit_tt_slot_set_head(uint8 instance, uint32 segment_id, uint16 slo
 	lsn = XLogInsert(RM_CLUSTER_UNDO_ID, XLOG_UNDO_TT_SLOT_SET_HEAD);
 
 	return lsn;
+}
+
+/* Spec 8.4D §12.10: insert the sole field-coded release certificate.  The
+ * caller owns block-0 X-current and flushes this LSN before publishing the
+ * exact TT release bit. */
+XLogRecPtr
+cluster_undo_xlog_insert_tt_ctrc_release(
+	const xl_undo_tt_slot_ctrc_release_v1 *record)
+{
+	uint8 bytes[CLUSTER_UNDO_TT_CTRC_RELEASE_BYTES];
+
+	if (!cluster_undo_tt_ctrc_release_encode(record, bytes))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("invalid canonical TT CTRC release certificate"),
+				 errdetail("segment_id=%u segment_generation=%u xid=%u cluster_epoch=%u root_id=" UINT64_FORMAT " root_generation=" UINT64_FORMAT " formation_epoch=" UINT64_FORMAT " admission_generation=" UINT64_FORMAT " seal_generation=" UINT64_FORMAT " touched_low=" UINT64_FORMAT " touched_high=" UINT64_FORMAT " slot_offset=%u slot_wrap=%u owner_instance=%u terminal_status=%u format_version=%u flags=%u",
+					 record != NULL ? record->segment_id : 0,
+					 record != NULL ? record->segment_generation : 0,
+					 record != NULL ? record->xid : 0,
+					 record != NULL ? record->cluster_epoch : 0,
+					 (uint64)(record != NULL ? record->root_id : 0),
+					 (uint64)(record != NULL ? record->root_generation : 0),
+					 (uint64)(record != NULL ? record->formation_epoch : 0),
+					 (uint64)(record != NULL
+						 ? record->admission_record_generation : 0),
+					 (uint64)(record != NULL ? record->seal_generation : 0),
+					 (uint64)(record != NULL ? record->touched_nodes_low : 0),
+					 (uint64)(record != NULL ? record->touched_nodes_high : 0),
+					 record != NULL ? record->slot_offset : 0,
+					 record != NULL ? record->slot_wrap : 0,
+					 record != NULL ? record->owner_instance : 0,
+					 record != NULL ? record->terminal_status : 0,
+					 record != NULL ? record->format_version : 0,
+					 record != NULL ? record->flags : 0)));
+	XLogBeginInsert();
+	XLogRegisterData((char *)bytes, sizeof(bytes));
+	return XLogInsert(RM_CLUSTER_UNDO_ID,
+		XLOG_UNDO_TT_SLOT_CTRC_RELEASE);
 }
 
 
@@ -1016,6 +1055,7 @@ cluster_tt_durable_redo_stamp_slot(uint8 instance, uint32 segment_id, uint16 slo
 		slot->xid = xid;
 		slot->wrap = wrap;
 		slot->status = TT_SLOT_COMMITTED;
+		slot->flags = TT_FLAGS_RESERVED;
 		slot->commit_scn = commit_scn;
 		slot->first_undo_block = InvalidUbaVal; /* spec-4.8 D7-A (P1#1): no stale head */
 
@@ -1117,6 +1157,7 @@ cluster_tt_durable_redo_stamp_slot_exact(uint8 instance, uint32 segment_id,
 		ssize_t written;
 
 		slot->status = TT_SLOT_COMMITTED;
+		slot->flags = TT_FLAGS_RESERVED;
 		slot->commit_scn = commit_scn;
 		slot->first_undo_block = InvalidUbaVal;
 		written = pg_pwrite(fd, blockbuf.data, BLCKSZ, 0);
@@ -1211,6 +1252,43 @@ cluster_undo_redo_tt_slot_set_head(const ClusterUndoDecoded *decoded)
 	cluster_tt_durable_redo_set_head_slot(decoded->instance,
 		decoded->segment_id, decoded->slot_offset, decoded->wrap,
 		decoded->xid, decoded->first_undo_block);
+}
+
+/* Replay the exact CTRC release certificate without consulting live
+ * formation state.  WAL order plus the physical segment/slot predecessor is
+ * the recovery authority; newer generation/wrap is a stale skip, while a
+ * same-incarnation conflict is corruption. */
+static void
+cluster_undo_redo_tt_ctrc_release(const ClusterUndoDecoded *decoded)
+{
+	xl_undo_tt_slot_ctrc_release_v1 record;
+
+	memset(&record, 0, sizeof(record));
+	record.segment_id = decoded->segment_id;
+	record.segment_generation = decoded->expected_generation;
+	record.xid = decoded->xid;
+	record.cluster_epoch = decoded->cluster_epoch;
+	record.root_id = decoded->root_id;
+	record.root_generation = decoded->root_generation;
+	record.formation_epoch = decoded->formation_epoch;
+	record.admission_record_generation
+		= decoded->admission_record_generation;
+	record.seal_generation = decoded->seal_generation;
+	record.touched_nodes_low = decoded->touched_nodes_low;
+	record.touched_nodes_high = decoded->touched_nodes_high;
+	memcpy(record.ack_set_digest, decoded->ack_set_digest,
+		sizeof(record.ack_set_digest));
+	record.slot_offset = decoded->slot_offset;
+	record.slot_wrap = decoded->wrap;
+	record.owner_instance = decoded->instance;
+	record.terminal_status = decoded->terminal_status;
+	record.format_version = decoded->format_version;
+	record.flags = decoded->flags;
+	if (!cluster_undo_tt_ctrc_release_valid(&record))
+		ereport(PANIC,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("invalid decoded TT CTRC release certificate")));
+	cluster_tt_durable_redo_ctrc_release_slot_exact(&record);
 }
 
 
@@ -1784,6 +1862,9 @@ cluster_undo_redo(XLogReaderState *record)
 		break;
 	case XLOG_UNDO_TT_SLOT_SET_HEAD:
 		cluster_undo_redo_tt_slot_set_head(&decoded);
+		break;
+	case XLOG_UNDO_TT_SLOT_CTRC_RELEASE:
+		cluster_undo_redo_tt_ctrc_release(&decoded);
 		break;
 	case XLOG_HW_RESERVE:
 		cluster_hw_redo_reserve(record);

@@ -40,6 +40,17 @@
 #define PGRAC_PCM_X_FENCE_DOMINATED(proof)
 #endif
 
+/* Keep the relation-class decision shared by SMGR-adjacent heap gates and
+ * BufferTag PCM tracking.  With shared_catalog off, catalog/system relations
+ * remain node-local and cannot have a real Resource-X ownership episode. */
+static inline bool
+cluster_pcm_x_relation_number_tracked(RelFileNumber rel_number,
+									  bool shared_catalog)
+{
+	return shared_catalog
+		|| rel_number >= (RelFileNumber) FirstNormalObjectId;
+}
+
 /* FSM pages are advisory and may be consumed without a content lock, so they
  * are outside PCM/PCM-X ownership.  Every other fork keeps the relation-level
  * user/shared-catalog tracking policy. */
@@ -48,7 +59,8 @@ cluster_pcm_x_buffer_tag_tracked(const BufferTag *tag, bool shared_catalog)
 {
 	if (tag == NULL || tag->forkNum == FSM_FORKNUM)
 		return false;
-	return shared_catalog || tag->relNumber >= (RelFileNumber)FirstNormalObjectId;
+	return cluster_pcm_x_relation_number_tracked(
+		tag->relNumber, shared_catalog);
 }
 
 typedef struct ClusterPcmOwnSnapshot {

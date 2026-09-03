@@ -12,6 +12,7 @@
 #include "postgres.h"
 
 #include "access/xact.h"
+#include "cluster/cluster_conf.h"
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_ges.h"
 #include "cluster/cluster_ges_reply_wait.h"
@@ -38,6 +39,7 @@
 #include "storage/lock.h"
 #include "storage/proc.h"
 #include "utils/timestamp.h"
+#include "utils/wait_event.h"
 
 #define CLUSTER_UNDO_BLOCK0_WALR_RESID_TYPE UINT8_C(0xFA)
 #define CLUSTER_UNDO_BLOCK0_CURRENT_RETRY_INITIAL_MS 100
@@ -170,6 +172,7 @@ static bool current_exit_hook_registered = false;
 #define CURRENT_ADMISSION_CENSUS UINT8_C(1)
 #define CURRENT_ADMISSION_LIVE_OWNER_SOURCE UINT8_C(2)
 #define CURRENT_ADMISSION_LIVE_OWNER_TARGET UINT8_C(3)
+#define CURRENT_ADMISSION_CTRC_RELEASE UINT8_C(4)
 
 static void current_backend_exit(int code, Datum arg);
 static void current_error_cleanup(int code, Datum arg);
@@ -200,8 +203,10 @@ static inline bool
 current_admission_recheck(const ClusterUndoBlock0CurrentGuardData *data)
 {
 	return data != NULL
-		   && (data->reserved[CURRENT_ADMISSION_BORROWED_INDEX]
-				   == CURRENT_ADMISSION_CENSUS
+		   && ((data->reserved[CURRENT_ADMISSION_BORROWED_INDEX]
+					== CURRENT_ADMISSION_CENSUS
+				 || data->reserved[CURRENT_ADMISSION_BORROWED_INDEX]
+					== CURRENT_ADMISSION_CTRC_RELEASE)
 				 ? cluster_semantic_activation_recheck_r4_terminal_census(
 					   &data->admission)
 				 : cluster_semantic_activation_recheck(&data->admission));
@@ -771,6 +776,12 @@ current_acquire_begin(const ClusterUndoBlock0LogicalKey *key,
 			&& mode == CLUSTER_UNDO_BLOCK0_SCUR
 			&& cluster_semantic_activation_recheck_r4_terminal_census(
 				caller_admission);
+		bool ctrc_release
+			= caller_admission_class == CURRENT_ADMISSION_CTRC_RELEASE
+			&& mode == CLUSTER_UNDO_BLOCK0_XCUR
+			&& caller_admission->side == CLUSTER_SEMANTIC_TARGET_SIDE
+			&& cluster_semantic_activation_recheck_r4_terminal_census(
+				caller_admission);
 		bool live_owner_source
 			= caller_admission_class == CURRENT_ADMISSION_LIVE_OWNER_SOURCE
 			&& mode == CLUSTER_UNDO_BLOCK0_XCUR
@@ -782,7 +793,8 @@ current_acquire_begin(const ClusterUndoBlock0LogicalKey *key,
 			&& caller_admission->side == CLUSTER_SEMANTIC_TARGET_SIDE
 			&& cluster_semantic_activation_recheck(caller_admission);
 
-		if (!census && !live_owner_source && !live_owner_target)
+		if (!census && !ctrc_release
+			&& !live_owner_source && !live_owner_target)
 			return current_unused_fail(
 				data, CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED, failure);
 	} else if (caller_admission_class != CURRENT_ADMISSION_OWNED) {
@@ -875,6 +887,28 @@ cluster_undo_block0_current_acquire_begin_admitted(
 	}
 	return current_acquire_begin(key, mode, timeout_ms, admission,
 		CURRENT_ADMISSION_CENSUS, guard, failure);
+}
+
+ClusterUndoBlock0CurrentStep
+cluster_undo_block0_current_acquire_begin_ctrc_release(
+	const ClusterUndoBlock0LogicalKey *key, int timeout_ms,
+	const ClusterSemanticAdmissionToken *admission,
+	ClusterUndoBlock0CurrentGuard *guard, ClusterUndoBlock0Result *failure)
+{
+	uint32 logical_slot;
+
+	if (admission == NULL
+		|| admission->side != CLUSTER_SEMANTIC_TARGET_SIDE
+		|| cluster_node_id < 0 || key == NULL
+		|| key->owner_instance != (uint8)(cluster_node_id + 1)
+		|| cluster_undo_block0_logical_slot(key, &logical_slot)
+		   != CLUSTER_UNDO_BLOCK0_OK)
+	{
+		current_set_failure(failure, CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED);
+		return CLUSTER_UNDO_BLOCK0_CURRENT_FAILED;
+	}
+	return current_acquire_begin(key, CLUSTER_UNDO_BLOCK0_XCUR, timeout_ms,
+		admission, CURRENT_ADMISSION_CTRC_RELEASE, guard, failure);
 }
 
 ClusterUndoBlock0CurrentStep
@@ -1010,6 +1044,31 @@ cluster_undo_block0_current_acquire_poll(ClusterUndoBlock0CurrentGuard *guard,
 		data->next_retry_at = TimestampTzPlusMilliseconds(now, backoff_ms);
 	}
 	return CLUSTER_UNDO_BLOCK0_CURRENT_PENDING;
+}
+
+bool
+cluster_undo_block0_current_wait_reply(ClusterUndoBlock0CurrentGuard *guard)
+{
+	ClusterUndoBlock0CurrentGuardData *data;
+	GesReplyWaitKey key;
+	uint32 opcode;
+
+	if (guard == NULL)
+		return false;
+	data = current_guard_data(guard);
+	if (!current_phase_valid(data->phase) || !data->active_linked
+		|| !data->reply_installed)
+		return false;
+	if (data->phase == CLUSTER_UNDO_BLOCK0_CURRENT_ACQUIRE_WAIT)
+		opcode = GES_REQ_OPCODE_REQUEST;
+	else if (data->phase == CLUSTER_UNDO_BLOCK0_CURRENT_RELEASE_WAIT)
+		opcode = GES_REQ_OPCODE_RELEASE;
+	else
+		return false;
+
+	current_fill_reply_key(data, opcode, &key);
+	return cluster_ges_reply_wait_sleep_exact(
+		&key, 1, WAIT_EVENT_CLUSTER_GES_REPLY_WAIT);
 }
 
 void
@@ -2103,7 +2162,8 @@ cluster_undo_block0_current_live_owner_recycle_exact(
 	XLogRecPtr recycle_lsn;
 	bool root_ok;
 
-	if (key == NULL || !SCN_VALID(horizon) || expected_epoch == 0
+	if (key == NULL || !SCN_VALID(horizon)
+		|| (expected_epoch == 0 && cluster_conf_node_count() != 4)
 		|| cluster_epoch_get_current() != expected_epoch || timeout_ms <= 0
 		|| cluster_node_id < 0
 		|| key->owner_instance != (uint8)(cluster_node_id + 1))
@@ -2131,6 +2191,8 @@ cluster_undo_block0_current_live_owner_recycle_exact(
 		current_live_owner_error_cleanup,
 		PointerGetDatum((ClusterUndoBlock0LiveOwnerCleanup *)&cleanup));
 	{
+		if (admission.formation_epoch != expected_epoch)
+			goto recycle_done;
 		root_ok = admission.side == CLUSTER_SEMANTIC_SOURCE_SIDE
 			? cluster_semantic_activation_resolve_shared_undo_root_live_owner_source(
 				  &admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED,

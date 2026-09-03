@@ -51,6 +51,8 @@ cluster_undo_kind_for_opcode(uint16 opcode)
 			return CLUSTER_UNDO_KIND_TT_ABORT;
 		case XLOG_UNDO_TT_SLOT_SET_HEAD:
 			return CLUSTER_UNDO_KIND_TT_SET_HEAD;
+		case XLOG_UNDO_TT_SLOT_CTRC_RELEASE:
+			return CLUSTER_UNDO_KIND_TT_CTRC_RELEASE;
 		case XLOG_UNDO_SEGMENT_RECYCLE:
 			return CLUSTER_UNDO_KIND_SEGMENT_RECYCLE;
 		case XLOG_UNDO_SEGMENT_REUSE:
@@ -176,6 +178,37 @@ cluster_undo_decode(XLogReaderState *record, ClusterUndoDecoded *out)
 				out->wrap = rec.wrap;
 				out->xid = rec.xid;
 				out->first_undo_block = rec.first_undo_block;
+				break;
+			}
+		case CLUSTER_UNDO_KIND_TT_CTRC_RELEASE:
+			{
+				xl_undo_tt_slot_ctrc_release_v1 rec;
+
+				if (XLogRecGetDataLen(record)
+					!= CLUSTER_UNDO_TT_CTRC_RELEASE_BYTES
+					|| !cluster_undo_tt_ctrc_release_decode(
+						(const uint8 *)XLogRecGetData(record), &rec))
+					return false;
+				out->instance = rec.owner_instance;
+				out->segment_id = rec.segment_id;
+				out->expected_generation = rec.segment_generation;
+				out->slot_offset = rec.slot_offset;
+				out->wrap = rec.slot_wrap;
+				out->xid = rec.xid;
+				out->cluster_epoch = rec.cluster_epoch;
+				out->root_id = rec.root_id;
+				out->root_generation = rec.root_generation;
+				out->formation_epoch = rec.formation_epoch;
+				out->admission_record_generation
+					= rec.admission_record_generation;
+				out->seal_generation = rec.seal_generation;
+				out->touched_nodes_low = rec.touched_nodes_low;
+				out->touched_nodes_high = rec.touched_nodes_high;
+				memcpy(out->ack_set_digest, rec.ack_set_digest,
+					sizeof(out->ack_set_digest));
+				out->format_version = rec.format_version;
+				out->flags = rec.flags;
+				out->terminal_status = rec.terminal_status;
 				break;
 			}
 		case CLUSTER_UNDO_KIND_SEGMENT_RECYCLE:
@@ -417,6 +450,27 @@ cluster_undo_preflight(const ClusterUndoDecoded *decoded)
 			} else if (decoded->format_version != 0 || decoded->wrap == 0)
 				return false;
 			break;
+		case CLUSTER_UNDO_KIND_TT_CTRC_RELEASE:
+			if (decoded->slot_offset >= TT_SLOTS_PER_SEGMENT
+				|| !TransactionIdIsNormal(decoded->xid)
+				|| decoded->expected_generation == 0
+				|| decoded->wrap == TT_WRAP_INVALID
+				|| decoded->cluster_epoch == 0
+				|| decoded->root_id == 0
+				|| decoded->root_generation == 0
+				|| decoded->formation_epoch == 0
+				|| decoded->admission_record_generation == 0
+				|| decoded->seal_generation == 0
+				|| decoded->touched_nodes_high != 0
+				|| (decoded->touched_nodes_low & ~UINT64_C(0xffff)) != 0
+				|| (decoded->terminal_status != TT_SLOT_COMMITTED
+					&& decoded->terminal_status != TT_SLOT_ABORTED)
+				|| decoded->format_version
+				   != CLUSTER_UNDO_TT_CTRC_RELEASE_VERSION
+				|| decoded->flags
+				   != CLUSTER_UNDO_TT_CTRC_RELEASE_ALL_TOUCHED_ACKED)
+				return false;
+			break;
 		case CLUSTER_UNDO_KIND_SEGMENT_RECYCLE:
 			if (decoded->old_state != SEGMENT_COMMITTED ||
 				decoded->new_state != SEGMENT_RECYCLABLE)
@@ -444,12 +498,45 @@ cluster_undo_preflight(const ClusterUndoDecoded *decoded)
 	return true;
 }
 
+static bool
+cluster_undo_ctrc_release_from_decoded(const ClusterUndoDecoded *decoded,
+	xl_undo_tt_slot_ctrc_release_v1 *record)
+{
+	if (decoded == NULL || record == NULL
+		|| decoded->kind != CLUSTER_UNDO_KIND_TT_CTRC_RELEASE)
+		return false;
+	memset(record, 0, sizeof(*record));
+	record->segment_id = decoded->segment_id;
+	record->segment_generation = decoded->expected_generation;
+	record->xid = decoded->xid;
+	record->cluster_epoch = decoded->cluster_epoch;
+	record->root_id = decoded->root_id;
+	record->root_generation = decoded->root_generation;
+	record->formation_epoch = decoded->formation_epoch;
+	record->admission_record_generation
+		= decoded->admission_record_generation;
+	record->seal_generation = decoded->seal_generation;
+	record->touched_nodes_low = decoded->touched_nodes_low;
+	record->touched_nodes_high = decoded->touched_nodes_high;
+	memcpy(record->ack_set_digest, decoded->ack_set_digest,
+		sizeof(record->ack_set_digest));
+	record->slot_offset = decoded->slot_offset;
+	record->slot_wrap = decoded->wrap;
+	record->owner_instance = decoded->instance;
+	record->terminal_status = decoded->terminal_status;
+	record->format_version = decoded->format_version;
+	record->flags = decoded->flags;
+	return cluster_undo_tt_ctrc_release_valid(record);
+}
+
 ClusterUndoTargetPreflightV1
 cluster_undo_preflight_tt_target_v1(const ClusterUndoDecoded *decoded)
 {
 	TTSlot		slot;
 	ClusterTTActiveTransitionDecision bind_decision;
 	ClusterTTTerminalTransitionDecision abort_decision;
+	ClusterUndoTtCtrcReleaseRedoDecision release_decision;
+	xl_undo_tt_slot_ctrc_release_v1 release_record;
 
 	if (!cluster_undo_preflight(decoded))
 		return CLUSTER_UNDO_TARGET_BLOCKED;
@@ -478,6 +565,24 @@ cluster_undo_preflight_tt_target_v1(const ClusterUndoDecoded *decoded)
 			return CLUSTER_UNDO_TARGET_APPLY;
 		if (abort_decision == CLUSTER_TT_TERMINAL_IDEMPOTENT
 			|| abort_decision == CLUSTER_TT_TERMINAL_STALE)
+			return CLUSTER_UNDO_TARGET_PROVED_NOOP;
+		return CLUSTER_UNDO_TARGET_BLOCKED;
+	}
+	if (decoded->kind == CLUSTER_UNDO_KIND_TT_CTRC_RELEASE)
+	{
+		if (!cluster_undo_ctrc_release_from_decoded(decoded,
+				&release_record))
+			return CLUSTER_UNDO_TARGET_BLOCKED;
+		release_decision
+			= cluster_tt_durable_ctrc_release_preflight_exact(
+				&release_record);
+		if (release_decision
+			== CLUSTER_UNDO_TT_CTRC_RELEASE_REDO_APPLY)
+			return CLUSTER_UNDO_TARGET_APPLY;
+		if (release_decision
+				== CLUSTER_UNDO_TT_CTRC_RELEASE_REDO_IDEMPOTENT
+			|| release_decision
+				== CLUSTER_UNDO_TT_CTRC_RELEASE_REDO_SKIP_STALE)
 			return CLUSTER_UNDO_TARGET_PROVED_NOOP;
 		return CLUSTER_UNDO_TARGET_BLOCKED;
 	}
@@ -535,6 +640,7 @@ cluster_undo_apply_tt_v1(const ClusterUndoDecoded *decoded)
 {
 	TTSlot		post_slot;
 	ClusterUndoTargetPreflightV1 target;
+	xl_undo_tt_slot_ctrc_release_v1 release_record;
 
 	target = cluster_undo_preflight_tt_target_v1(decoded);
 	if (target == CLUSTER_UNDO_TARGET_BLOCKED)
@@ -572,6 +678,16 @@ cluster_undo_apply_tt_v1(const ClusterUndoDecoded *decoded)
 				decoded->segment_id, decoded->slot_offset, decoded->wrap,
 				decoded->xid);
 			break;
+		case CLUSTER_UNDO_KIND_TT_CTRC_RELEASE:
+			if (!cluster_undo_ctrc_release_from_decoded(decoded,
+					&release_record))
+				return CLUSTER_UNDO_APPLY_BLOCKED;
+			cluster_tt_durable_redo_ctrc_release_slot_exact(
+				&release_record);
+			if (cluster_undo_preflight_tt_target_v1(decoded)
+				!= CLUSTER_UNDO_TARGET_PROVED_NOOP)
+				return CLUSTER_UNDO_APPLY_POST_READ_FAILED;
+			return CLUSTER_UNDO_APPLY_OK;
 		case CLUSTER_UNDO_KIND_TT_SET_HEAD:
 			cluster_tt_durable_redo_set_head_slot(decoded->instance,
 				decoded->segment_id, decoded->slot_offset, decoded->wrap,

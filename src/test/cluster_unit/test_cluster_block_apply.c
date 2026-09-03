@@ -82,6 +82,7 @@ bool cluster_recmerge_window_active = false;
 uint64 cluster_recmerge_window_scn = 0;
 uint64 cluster_recmerge_window_own_lsn = 0;
 bool cluster_recmerge_apply_foreign = false;
+int cluster_node_id = 0;
 
 /* Controllable RestoreBlockImage stub. */
 static bool stub_restore_ret = true;	   /* what RestoreBlockImage returns */

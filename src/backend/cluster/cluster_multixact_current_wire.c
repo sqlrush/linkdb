@@ -21,6 +21,7 @@
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_multixact_current_wire.h"
 #include "cluster/cluster_xid_stripe.h"
+#include "storage/backendid.h"
 
 
 static bool
@@ -190,10 +191,11 @@ cluster_multixact_current_wire_validate_proof_forward(
 			|| challenge->member_status > MaxMultiXactStatus
 			|| !ISUPDATE_from_mxstatus(challenge->member_status) || challenge->reserved8 != 0
 			|| cluster_xid_origin_slot(challenge->updater_xid) != local_node
-			|| !wire_tt_key_valid(&challenge->candidate_next_xmin_key, current_epoch,
-								  local_node, challenge->updater_xid)
-			|| !bytes_are_zero(message.trailer.body.updater.reserved,
-							   sizeof(message.trailer.body.updater.reserved)))
+			|| !cluster_multixact_current_successor_provenance_well_formed(
+				&challenge->candidate_next_xmin_alias,
+				&challenge->candidate_next_xmin_locator,
+				challenge->updater_xid, (uint16)local_node,
+				(uint32)current_epoch))
 			return false;
 		break;
 	}
@@ -243,6 +245,10 @@ cluster_multixact_current_wire_build_proof_requests(
 	uint16 built = 0;
 	uint16 origin;
 	uint16 i;
+	/* The auxiliary undo cleaner owns CTRC progress and has no BackendId.
+	 * It may consume a same-node proof plan directly; such a plan remains
+	 * invalid to every wire validator and may never target a foreign node. */
+	bool local_only = requester_backend_id == InvalidBackendId;
 
 	if (plan_count != NULL)
 		*plan_count = 0;
@@ -253,7 +259,8 @@ cluster_multixact_current_wire_build_proof_requests(
 	if (key == NULL || members == NULL || member_origin_nodes == NULL || plans == NULL
 		|| plan_count == NULL || nmembers < 1 || request_id == 0
 		|| !wire_epoch_valid(current_epoch) || requester_node < 0
-		|| requester_node >= CLUSTER_MAX_NODES || requester_backend_id <= 0
+		|| requester_node >= CLUSTER_MAX_NODES
+		|| (requester_backend_id <= 0 && !local_only)
 		|| !wire_mxkey_valid(key, current_epoch)
 		|| cluster_multixact_current_validate_descriptor(
 			   key, key->origin_node_id, (uint32)current_epoch, members, nmembers, nmembers)
@@ -267,7 +274,8 @@ cluster_multixact_current_wire_build_proof_requests(
 		int derived_origin = cluster_xid_origin_slot(members[i].xid);
 
 		if (derived_origin < 0 || derived_origin >= CLUSTER_MAX_NODES
-			|| member_origin_nodes[i] != (uint16)derived_origin)
+			|| member_origin_nodes[i] != (uint16)derived_origin
+			|| (local_only && derived_origin != requester_node))
 			return CMX_RESOLVE_UNKNOWN;
 		if (ISUPDATE_from_mxstatus(members[i].member_status))
 			updater_ordinal = i;
@@ -278,9 +286,12 @@ cluster_multixact_current_wire_build_proof_requests(
 		if (updater_ordinal < 0 || challenge->reserved16 != 0
 			|| challenge->member_ordinal != (uint16)updater_ordinal
 			|| challenge->updater_xid != members[updater_ordinal].xid
-			|| !wire_tt_key_valid(&challenge->candidate_next_xmin_key, current_epoch,
-								  member_origin_nodes[updater_ordinal],
-								  members[updater_ordinal].xid))
+			|| !cluster_multixact_current_successor_provenance_well_formed(
+				&challenge->candidate_next_xmin_alias,
+				&challenge->candidate_next_xmin_locator,
+				members[updater_ordinal].xid,
+				member_origin_nodes[updater_ordinal],
+				(uint32)current_epoch))
 			return CMX_RESOLVE_UNKNOWN;
 		Assert(origin_counts[member_origin_nodes[updater_ordinal]] > 0);
 		origin_counts[member_origin_nodes[updater_ordinal]]--;
@@ -330,7 +341,10 @@ cluster_multixact_current_wire_build_proof_requests(
 							CLUSTER_CURRENT_MX_PROOF_BODY_UPDATER_CHALLENGE);
 		plan->request.prefix.entry_count = 1;
 		wire_challenge = &plan->request.trailer.body.updater.challenge;
-		wire_challenge->candidate_next_xmin_key = challenge->candidate_next_xmin_key;
+		wire_challenge->candidate_next_xmin_alias
+			= challenge->candidate_next_xmin_alias;
+		wire_challenge->candidate_next_xmin_locator
+			= challenge->candidate_next_xmin_locator;
 		wire_challenge->updater_xid = challenge->updater_xid;
 		wire_challenge->member_ordinal = challenge->member_ordinal;
 		wire_challenge->member_status = members[updater_ordinal].member_status;
@@ -414,8 +428,13 @@ wire_updater_proof_valid(const ClusterCurrentUpdaterProof *proof,
 		= &request->trailer.body.updater.challenge;
 
 	return proof != NULL && wire_mxkey_equal(&proof->mxkey, &request->prefix.mxkey)
-		   && memcmp(&proof->candidate_next_xmin_key, &challenge->candidate_next_xmin_key,
-					 sizeof(ClusterTTStatusKey))
+		   && memcmp(&proof->candidate_next_xmin_alias,
+					 &challenge->candidate_next_xmin_alias,
+					 sizeof(ClusterCurrentMxSuccessorAlias))
+				  == 0
+		   && memcmp(&proof->candidate_next_xmin_locator,
+					 &challenge->candidate_next_xmin_locator,
+					 sizeof(ClusterTxLocator))
 				  == 0
 		   && proof->updater_xid == challenge->updater_xid
 		   && proof->member_ordinal == challenge->member_ordinal

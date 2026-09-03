@@ -138,6 +138,24 @@ cluster_undo_desc(StringInfo buf, XLogReaderState *record)
 						 xlrec->xid);
 		break;
 	}
+	case XLOG_UNDO_TT_SLOT_CTRC_RELEASE: {
+		xl_undo_tt_slot_ctrc_release_v1 rec;
+
+		if (XLogRecGetDataLen(record)
+			!= CLUSTER_UNDO_TT_CTRC_RELEASE_BYTES
+			|| !cluster_undo_tt_ctrc_release_decode((const uint8 *)payload,
+				&rec))
+			appendStringInfo(buf, "malformed TT CTRC release payload");
+		else
+			appendStringInfo(buf,
+				"instance %u seg %u generation %u slot %u wrap %u xid %u terminal %u seal " UINT64_FORMAT " touched " UINT64_FORMAT,
+				(unsigned)rec.owner_instance, (unsigned)rec.segment_id,
+				(unsigned)rec.segment_generation, (unsigned)rec.slot_offset,
+				(unsigned)rec.slot_wrap, (unsigned)rec.xid,
+				(unsigned)rec.terminal_status, rec.seal_generation,
+				rec.touched_nodes_low);
+		break;
+	}
 	case XLOG_HW_RESERVE: {
 		xl_hw_reserve *xlrec = (xl_hw_reserve *)payload;
 
@@ -175,6 +193,8 @@ cluster_undo_identify(uint8 info)
 		return "UNDO_BLOCK_WRITE_MULTI";
 	case XLOG_UNDO_TT_SLOT_SET_HEAD:
 		return "UNDO_TT_SLOT_SET_HEAD";
+	case XLOG_UNDO_TT_SLOT_CTRC_RELEASE:
+		return "UNDO_TT_SLOT_CTRC_RELEASE";
 	case XLOG_HW_RESERVE:
 		return "HW_RESERVE";
 	default:

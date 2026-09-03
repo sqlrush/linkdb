@@ -23,8 +23,9 @@
  *	  flushes relation buffers to shared storage during cross-node key-object
  *	  invalidation drain (cluster_ko_drain_inbound_and_apply ->
  *	  FlushRelationsAllBuffers) and therefore participates in IO statistics;
- *	  the remaining cluster aux types do not perform buffer-manager IO and
- *	  stay untracked.
+ *	  CTRC terminal cleanout also makes B_UNDO_CLEANER read and dirty relation
+ *	  buffers.  Those two auxiliary types participate in IO statistics; the
+ *	  remaining cluster aux types stay untracked.
  *
  *	  See docs/background-process-design.md and spec-5.7-misc-enqueue-classes.md.
  *
@@ -322,20 +323,22 @@ pgstat_io_snapshot_cb(void)
 *
 * What changed:
 *	  Added the pgrac cluster background process types (B_CLUSTER_STATS ..
-*	  B_RFS) to the switch below.  B_SINVAL_BCAST returns true; the
-*	  other cluster aux types return false.
+*	  B_RFS) to the switch below.  B_SINVAL_BCAST and B_UNDO_CLEANER return
+*	  true; the other cluster aux types return false.
 *
 * Why:
 *	  The sinval broadcaster flushes relation buffers to shared storage in
 *	  cluster_ko_drain_inbound_and_apply() -> FlushRelationsAllBuffers(),
-*	  which calls pgstat_count_io_op_n() (IOOP_WRITE on IOOBJECT_RELATION).
-*	  Without registering B_SINVAL_BCAST here, that call's
-*	  Assert(pgstat_tracks_io_op(...)) fails and the aux process crashes on
+*	  while CTRC terminal cleanout runs ReadBufferWithoutRelcache() and
+*	  GenericXLog relation-buffer updates from B_UNDO_CLEANER.  Without
+*	  registering either process here, the
+*	  Assert(pgstat_tracks_io_op(...)) check fails and the aux process crashes on
 *	  cassert builds (observed: t/090 peer sinval broadcaster TRAP at
-*	  pgstat_io.c:88).  The other cluster aux types do not reach the buffer
-*	  manager IO counters (recovery replay uses smgrwrite() directly), so
-*	  they stay untracked -- preserving prior fall-through behaviour while
-*	  keeping this switch exhaustive (no -Wswitch warning).
+*	  pgstat_io.c:88; t/405 CTRC cleaner TRAP at pgstat_io.c:105).  The other
+*	  cluster aux types do not reach the buffer manager IO counters (recovery
+*	  replay uses smgrwrite() directly), so they stay untracked -- preserving
+*	  prior fall-through behaviour while keeping this switch exhaustive (no
+*	  -Wswitch warning).
 *
 *	  See spec-5.7-misc-enqueue-classes.md and docs/background-process-design.md.
 * ----------------------------------------------------------------------
@@ -390,6 +393,7 @@ pgstat_tracks_io_bktype(BackendType bktype)
 		 * cross-node retention-read path (t/370). */
 		case B_LMS:
 		case B_LMS_WORKER:
+		case B_UNDO_CLEANER:
 			return true;
 
 		/* PGRAC: cluster aux types that do not perform buffer-manager IO. */
@@ -406,7 +410,6 @@ pgstat_tracks_io_bktype(BackendType bktype)
 		case B_RECOVERY_COORD:
 		case B_RECOVERY_WORKER:
 		case B_TT_GC:
-		case B_UNDO_CLEANER:
 			return false;
 	}
 

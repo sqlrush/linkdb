@@ -198,6 +198,47 @@ sub wait_for_resource_x_terminal_drain
 	return (0, \@outstanding, \@wait_edges);
 }
 
+sub wait_for_resource_x_protocol_quiescence
+{
+	my ($quad, $timeout_seconds) = @_;
+	my @pcm_debt_keys = qw(
+		pcm_grd_wait_refcount
+		pcm_grd_transport_refcount
+		resource_x_retained_debt_count
+		resource_x_active_debt_count
+		resource_x_local_owner_debt_count
+		resource_x_evicting_debt_count
+		resource_x_invalid_debt_count
+		convert_queue_active
+	);
+	my $deadline = time() + $timeout_seconds;
+	my @last;
+
+	do
+	{
+		@last = ();
+		my $drained = 1;
+		for my $i (0 .. 3)
+		{
+			my $pcm = state_snapshot($quad->node($i), 'pcm', \@pcm_debt_keys);
+			my %debt = (
+				%{$pcm},
+				outstanding => state_int(
+					$quad->node($i), 'gcs', 'outstanding_count'),
+				wait_edges => state_int(
+					$quad->node($i), 'lmd', 'wait_edge_count'),
+			);
+
+			push @last, \%debt;
+			$drained = 0 if grep { $_ != 0 } values(%debt);
+		}
+		return (1, \@last) if $drained;
+		usleep(100_000);
+	} while (time() < $deadline);
+
+	return (0, \@last);
+}
+
 sub wait_for_node_state_gt
 {
 	my ($node, $category, $key, $before, $timeout_seconds) = @_;
@@ -1210,6 +1251,18 @@ ok(write_retry($quad->node0, 'CHECKPOINT'),
 	'L5F checkpointed before the destructive finish-Flush test');
 my $flush_error_relfilenode = $quad->node0->safe_psql('postgres',
 	q{SELECT pg_relation_filenode('pcm_xq_flush_error'::regclass)}) + 0;
+my ($pre_fault_drained, $pre_fault_debt)
+	= wait_for_resource_x_protocol_quiescence($quad, 30);
+unless ($pre_fault_drained)
+{
+	for my $i (0 .. 3)
+	{
+		diag("L5F pre-fault node$i debt="
+			. join(',', map { "$_=$pre_fault_debt->[$i]{$_}" }
+				sort keys %{$pre_fault_debt->[$i]}));
+	}
+	die "L5F cannot arm a destructive injection over prior protocol debt\n";
+}
 my $flush_error_log_offset = (-s $quad->node0->logfile) // 0;
 
 $quad->node0->safe_psql('postgres', q{

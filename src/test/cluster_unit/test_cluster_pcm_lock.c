@@ -3969,6 +3969,66 @@ UT_TEST(test_resource_x_bootstrap_round_fans_in_and_retries_same_attempt)
 	UT_ASSERT_EQ(action, RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED);
 }
 
+UT_TEST(test_resource_x_requester_round_blocks_local_s_only_until_x_cached)
+{
+	BufferTag tag = make_tag(469);
+	ResourceXAssertion assertion;
+	ResourceXDecodedFrame request;
+	ResourceXDecodedFrame ack;
+	ResourceXDecodedFrame asserted;
+	ResourceXAcquisitionRef terminal_ref;
+	ResourceXAcquisitionRef expected_ref;
+	ResourceXBufferInstallProof install;
+	ResourceXBufferActivationProof activation;
+	ResourceXBootstrapRoundAction action;
+
+	reset_fake_pcm_runtime(4);
+	cluster_node_id = 1;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(17),
+		RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT(resource_x_assertion_init(&tag, 1, &assertion));
+	UT_ASSERT(!cluster_pcm_lock_resource_x_requester_s_barrier_active_exact(
+		&tag));
+
+	action = cluster_pcm_lock_resource_x_bootstrap_round_step_exact(
+		&assertion, 0, 17, 31, 77, 51, 61,
+		UINT64_C(1000), UINT64_C(100), UINT64_C(50), false, 0,
+		&request, &terminal_ref);
+	UT_ASSERT_EQ(action,
+		RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_REQUEST);
+	UT_ASSERT(cluster_pcm_lock_resource_x_requester_s_barrier_active_exact(
+		&tag));
+
+	ack = make_resource_x_bootstrap_ack_values(
+		&request, UINT64_C(9), UINT32_C(71));
+	action = cluster_pcm_lock_resource_x_bootstrap_round_accept_ack_exact(
+		&ack, 0, 61, 77, UINT64_C(150), &asserted);
+	UT_ASSERT_EQ(action, RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_ASSERT);
+	UT_ASSERT(cluster_pcm_lock_resource_x_requester_s_barrier_active_exact(
+		&tag));
+
+	cluster_pcm_lock_acquire(tag, PCM_LOCK_MODE_X);
+	expected_ref = make_resource_x_acquisition_ref(tag, 1, 17, 1);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_t1_grant_exact(&expected_ref),
+		RESOURCE_X_APPLY_APPLIED);
+	memset(&install, 0, sizeof(install));
+	install.ownership_generation = 91;
+	install.writer_activation_token = 12;
+	install.resource_x_activation_generation = 1;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_requester_apply_exact(
+		&expected_ref, &install), RESOURCE_X_APPLY_APPLIED);
+	memset(&activation, 0, sizeof(activation));
+	activation.ownership_generation = 91;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_requester_activate_exact(
+		&expected_ref, &activation), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(
+		cluster_pcm_lock_resource_x_bootstrap_round_publish_terminal_exact(
+			&expected_ref, 31, 77, 91, 10, UINT64_C(160)),
+		RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT(!cluster_pcm_lock_resource_x_requester_s_barrier_active_exact(
+		&tag));
+}
+
 UT_TEST(test_resource_x_bootstrap_expired_round_allows_only_fresh_acquisition)
 {
 	BufferTag tag = make_tag(268);
@@ -4834,6 +4894,22 @@ UT_TEST(test_resource_x_bootstrap_round_waits_only_for_exact_target_install)
 
 	ref = make_resource_x_acquisition_ref(tag, 1, 17, 1);
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_t1_grant_exact(&ref),
+		RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT(
+		cluster_pcm_lock_resource_x_bootstrap_round_target_install_inflight_exact(
+			&assertion, 0, 17, 31, 77, 51, 61, UINT64_C(50),
+			&installing));
+	/* A conditional content-lock miss is the executor's retryable BLOCKED
+	 * state, not ownership loss.  The same-node foreground follower must keep
+	 * waiting both before and after the existing scheduled tick rearms the
+	 * exact acquisition; dispatch_phase is a retry counter, not authority. */
+	cluster_pcm_lock_resource_x_publish_no_progress_exact(
+		&ref, RESOURCE_X_NO_PROGRESS_BUFFER_BUSY);
+	UT_ASSERT(
+		cluster_pcm_lock_resource_x_bootstrap_round_target_install_inflight_exact(
+			&assertion, 0, 17, 31, 77, 51, 61, UINT64_C(50),
+			&installing));
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_executor_rearm_exact(&ref),
 		RESOURCE_X_APPLY_APPLIED);
 	UT_ASSERT(
 		cluster_pcm_lock_resource_x_bootstrap_round_target_install_inflight_exact(
@@ -12257,7 +12333,7 @@ UT_TEST(test_clean_page_xfer_arm_is_one_shot)
 int
 main(void)
 {
-	UT_PLAN(175);
+	UT_PLAN(176);
 	UT_RUN(test_pcm_lock_mode_constant_aliases_match_pcm_state);
 	UT_RUN(test_pcm_lock_transition_count_is_9);
 	UT_RUN(test_pcm_lock_transition_enum_values_are_1_to_9);
@@ -12329,6 +12405,7 @@ main(void)
 	UT_RUN(test_resource_x_bootstrap_dispatches_one_current_base_at_a_time);
 	UT_RUN(test_resource_x_bootstrap_r8_clears_old_binding_not_attempt_floor);
 	UT_RUN(test_resource_x_bootstrap_round_fans_in_and_retries_same_attempt);
+	UT_RUN(test_resource_x_requester_round_blocks_local_s_only_until_x_cached);
 	UT_RUN(test_resource_x_bootstrap_expired_round_allows_only_fresh_acquisition);
 	UT_RUN(test_resource_x_bootstrap_round_binds_exact_direct_init_reservation);
 	UT_RUN(test_resource_x_pre_assert_authority_drift_discards_exact_round_only);

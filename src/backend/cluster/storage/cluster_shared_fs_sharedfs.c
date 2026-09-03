@@ -86,6 +86,9 @@ static const ClusterSharedFsCaps cluster_shared_fs_sharedfs_caps = {
 	.max_nodes = CLUSTER_MAX_NODES,
 };
 
+#define CLUSTER_SHAREDFS_EOF_RECHECK_ATTEMPTS 100
+#define CLUSTER_SHAREDFS_EOF_RECHECK_US 1000L
+
 /*
  * Per-fork open-file state.  Identical shape to the local backend's
  * handle: the only difference between the two backends is which path
@@ -361,30 +364,45 @@ cluster_shared_fs_sharedfs_extend(ClusterSharedFsHandle *handle, BlockNumber blo
 static BlockNumber
 cluster_shared_fs_sharedfs_nblocks(ClusterSharedFsHandle *handle)
 {
-	off_t size;
+	off_t size = -1;
+	int recheck;
 
 	Assert(handle != NULL && handle->opened);
 
-	size = FileSize(handle->vfd);
-	if (size < 0)
-		ereport(ERROR, (errcode_for_file_access(),
-						errmsg("cluster_shared_fs.shared_fs: could not stat file: %m")));
+	/*
+	 * An extending 8 KiB pwrite can make the first 4 KiB page visible in
+	 * i_size before the syscall publishes the second page.  A concurrent
+	 * nblocks reader must not turn that in-flight, pre-return state into a
+	 * cluster-wide corruption verdict.  Re-sample for one short fixed budget;
+	 * aligned observations remain the only values ever returned.
+	 */
+	for (recheck = 0; recheck < CLUSTER_SHAREDFS_EOF_RECHECK_ATTEMPTS;
+		 recheck++)
+	{
+		size = FileSize(handle->vfd);
+		if (size < 0)
+			ereport(ERROR, (errcode_for_file_access(),
+							errmsg("cluster_shared_fs.shared_fs: could not stat file: %m")));
+		if (size % BLCKSZ == 0)
+			return (BlockNumber)(size / BLCKSZ);
+		if (recheck + 1 < CLUSTER_SHAREDFS_EOF_RECHECK_ATTEMPTS)
+			pg_usleep(CLUSTER_SHAREDFS_EOF_RECHECK_US);
+	}
 
 	/*
 	 * File size MUST be a whole multiple of BLCKSZ; a partial tail block
-	 * is storage corruption (post-crash truncated tail, misalignment) and
-	 * is reported rather than silently truncated by integer division.
-	 * Mirrors the local backend's Sprint A hardening.
+	 * that persists across the bounded concurrent-extend recheck is storage
+	 * corruption (post-crash truncated tail, misalignment) and is reported
+	 * rather than silently truncated by integer division.  Mirrors the local
+	 * backend's Sprint A hardening after excluding the live-write window.
 	 */
-	if (size % BLCKSZ != 0)
-		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
-						errmsg("cluster_shared_fs.shared_fs: relation file size " INT64_FORMAT
-							   " is not a multiple of BLCKSZ %d",
-							   (int64)size, BLCKSZ),
-						errhint("This indicates shared-storage corruption (truncated tail / "
-								"misalignment).  Restore from a known-good backup.")));
-
-	return (BlockNumber)(size / BLCKSZ);
+	ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+					errmsg("cluster_shared_fs.shared_fs: relation file size " INT64_FORMAT
+						   " is not a multiple of BLCKSZ %d",
+						   (int64)size, BLCKSZ),
+					errhint("This indicates shared-storage corruption (truncated tail / "
+							"misalignment).  Restore from a known-good backup.")));
+	return InvalidBlockNumber;
 }
 
 

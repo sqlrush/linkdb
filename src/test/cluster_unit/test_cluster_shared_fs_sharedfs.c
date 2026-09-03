@@ -51,6 +51,7 @@
 #include <fcntl.h>
 #include <stdarg.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include "cluster/storage/cluster_shared_fs.h"
@@ -81,6 +82,14 @@ char *cluster_shared_data_dir = NULL;
 char *cluster_shared_storage_uuid = NULL;
 int cluster_node_id = 0;
 bool IsUnderPostmaster = false;
+
+/* Scripted FileSize/pg_usleep surface for the concurrent-extend EOF tests. */
+static off_t file_size_script[8];
+static int file_size_script_len = 0;
+static int file_size_script_pos = 0;
+static bool file_size_script_repeat_last = false;
+static int file_size_call_count = 0;
+static int pg_usleep_call_count = 0;
 
 /* Cluster injection support (CLUSTER_INJECTION_POINT() expansion). */
 #include "cluster/cluster_inject.h"
@@ -247,9 +256,28 @@ FileSize(File f)
 {
 	struct stat st;
 
+	file_size_call_count++;
+	if (file_size_script_len > 0) {
+		int pos = file_size_script_pos;
+
+		if (pos >= file_size_script_len) {
+			if (!file_size_script_repeat_last)
+				abort();
+			pos = file_size_script_len - 1;
+		} else
+			file_size_script_pos++;
+		return file_size_script[pos];
+	}
+
 	if (fstat((int)f, &st) != 0)
 		return -1;
 	return st.st_size;
+}
+
+void
+pg_usleep(long microsec pg_attribute_unused())
+{
+	pg_usleep_call_count++;
 }
 
 int
@@ -418,6 +446,27 @@ read_mirror(MirrorSharedControl *out)
 	return n == (ssize_t)sizeof(*out);
 }
 
+static void
+set_file_size_script(const off_t *values, int count, bool repeat_last)
+{
+	UT_ASSERT(count > 0);
+	UT_ASSERT(count <= lengthof(file_size_script));
+	memcpy(file_size_script, values, sizeof(*values) * count);
+	file_size_script_len = count;
+	file_size_script_pos = 0;
+	file_size_script_repeat_last = repeat_last;
+	file_size_call_count = 0;
+	pg_usleep_call_count = 0;
+}
+
+static void
+clear_file_size_script(void)
+{
+	file_size_script_len = 0;
+	file_size_script_pos = 0;
+	file_size_script_repeat_last = false;
+}
+
 
 /* ============================================================
  * Backend I/O round trip (D1)
@@ -496,6 +545,60 @@ UT_TEST(test_sharedfs_extend_zero_fills)
 	memset(readback, 0xFF, sizeof(readback));
 	UT_ASSERT_EQ(ops->read(h, 2, readback), BLCKSZ);
 	UT_ASSERT_EQ(memcmp(readback, zero, BLCKSZ), 0);
+	ops->close(h);
+	ops->unlink(rl, MAIN_FORKNUM);
+}
+
+/* An 8 KiB pwrite that extends a regular file can expose its first 4 KiB
+ * page through i_size while the syscall is still completing.  nblocks must
+ * re-sample that in-flight tail rather than classify it as durable damage. */
+UT_TEST(test_nblocks_rechecks_transient_partial_extend)
+{
+	const ClusterSharedFsOps *ops = &cluster_shared_fs_sharedfs_ops;
+	RelFileLocator rl = { .spcOid = 1663, .dbOid = 5, .relNumber = 24578 };
+	ClusterSharedFsHandle *h = NULL;
+	const off_t sizes[] = { BLCKSZ + BLCKSZ / 2, 2 * BLCKSZ };
+	BlockNumber nblocks;
+
+	fresh_root("nblocks_transient");
+	ops->create(rl, MAIN_FORKNUM, false, &h);
+	set_file_size_script(sizes, lengthof(sizes), false);
+	nblocks = ops->nblocks(h);
+
+	UT_ASSERT_EQ((int)nblocks, 2);
+	UT_ASSERT_EQ(file_size_call_count, 2);
+	UT_ASSERT_EQ(pg_usleep_call_count, 1);
+	clear_file_size_script();
+	ops->close(h);
+	ops->unlink(rl, MAIN_FORKNUM);
+}
+
+/* Revalidation is bounded and cannot turn a persistent partial block into a
+ * rounded-down success.  The test error shim records the production ERROR and
+ * lets this standalone process inspect the exhausted retry surface. */
+UT_TEST(test_nblocks_persistent_partial_tail_stays_failclosed)
+{
+	const ClusterSharedFsOps *ops = &cluster_shared_fs_sharedfs_ops;
+	RelFileLocator rl = { .spcOid = 1663, .dbOid = 5, .relNumber = 24579 };
+	ClusterSharedFsHandle *h = NULL;
+	const off_t sizes[] = { BLCKSZ + BLCKSZ / 2 };
+	pid_t child;
+	int status = 0;
+
+	fresh_root("nblocks_persistent");
+	ops->create(rl, MAIN_FORKNUM, false, &h);
+	fflush(NULL);
+	child = fork();
+	UT_ASSERT(child >= 0);
+	if (child == 0) {
+		set_file_size_script(sizes, lengthof(sizes), true);
+		(void)ops->nblocks(h);
+		_exit(0);
+	}
+	UT_ASSERT_EQ(waitpid(child, &status, 0), child);
+	UT_ASSERT(WIFSIGNALED(status));
+	UT_ASSERT_EQ(WTERMSIG(status), SIGABRT);
+	clear_file_size_script();
 	ops->close(h);
 	ops->unlink(rl, MAIN_FORKNUM);
 }
@@ -601,9 +704,11 @@ UT_TEST(test_sentinel_missing_file_fails_closed)
 int
 main(void)
 {
-	UT_PLAN(8);
+	UT_PLAN(10);
 	UT_RUN(test_sharedfs_roundtrip_and_owner_agnostic);
 	UT_RUN(test_sharedfs_extend_zero_fills);
+	UT_RUN(test_nblocks_rechecks_transient_partial_extend);
+	UT_RUN(test_nblocks_persistent_partial_tail_stays_failclosed);
 	UT_RUN(test_sentinel_attach_records_self);
 	UT_RUN(test_sentinel_attach_idempotent);
 	UT_RUN(test_sentinel_second_node_joins);

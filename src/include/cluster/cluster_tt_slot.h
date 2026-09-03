@@ -131,7 +131,9 @@ StaticAssertDecl(offsetof(TTSlot, first_undo_block) == 16,
 #define TT_WRAP_MAX ((uint16)0xFFFE)	 /* last permitted reuse */
 #define TT_WRAP_INVALID ((uint16)0xFFFF) /* corruption sentinel */
 
-#define TT_FLAGS_RESERVED ((uint8)0) /* Stage 1 placeholder */
+#define TT_FLAGS_RESERVED ((uint8)0) /* no terminal release evidence */
+#define TT_SLOT_FLAG_CTRC_RELEASE_PROVEN UINT8_C(0x01)
+#define TT_SLOT_FLAGS_KNOWN TT_SLOT_FLAG_CTRC_RELEASE_PROVEN
 
 #define TT_SLOTS_PER_SEGMENT 48 /* Spec: spec-1.20-tt-slot-data-structure.md */
 

@@ -105,6 +105,7 @@ static bool test_wait_latch_sleeps;
 static TransactionId test_local_xid;
 static bool test_legacy_tt_found;
 static ClusterTTStatus test_legacy_tt_status;
+static int test_legacy_tt_dispatch_calls;
 static bool test_fail_stop_armed;
 static int test_last_elevel;
 static bool test_exceptional_condition_hit;
@@ -265,6 +266,7 @@ cluster_tt_status_source_dispatch(ClusterTTStatusSourceOp op,
 							  const ClusterTTStatusSourceRequest *request,
 							  ClusterTTStatusSourceResult *result)
 {
+	test_legacy_tt_dispatch_calls++;
 	UT_ASSERT_EQ((int)op, (int)CLUSTER_TT_SOURCE_LOOKUP);
 	UT_ASSERT_NOT_NULL(request);
 	UT_ASSERT_NOT_NULL(request->key);
@@ -580,6 +582,7 @@ reset_fixture(void)
 	test_local_xid = (TransactionId)700;
 	test_legacy_tt_found = false;
 	test_legacy_tt_status = CLUSTER_TT_STATUS_IN_PROGRESS;
+	test_legacy_tt_dispatch_calls = 0;
 	test_fail_stop_armed = false;
 	test_last_elevel = 0;
 	test_exceptional_condition_hit = false;
@@ -987,14 +990,59 @@ UT_TEST(test_current_mx_waker_counts_only_current_source)
 UT_TEST(test_current_mx_source_wait_consumes_deadlock_token_after_cleanup)
 {
 	ClusterTTStatusKey source = test_source_key();
+	uint64 deadline_mono_us = 0;
 
 	reset_fixture();
 	test_cancel_token_pending = true;
-	UT_ASSERT_EQ(cluster_tx_enqueue_wait_current_mx(&source, 1000),
+	UT_ASSERT_EQ(cluster_tx_enqueue_wait_current_mx(&source, 1000,
+				 &deadline_mono_us),
 				 CLUSTER_TXW_DEADLOCK);
+	UT_ASSERT(deadline_mono_us != 0);
 	UT_ASSERT(!test_cancel_token_pending);
 	UT_ASSERT_EQ(test_wait_clear_calls, 1);
 	UT_ASSERT_EQ(test_wfg_exact_cancel_calls, 1);
+	assert_slot_clean();
+}
+
+UT_TEST(test_current_mx_active_poll_retries_without_dormant_source)
+{
+	ClusterTTStatusKey source = test_source_key();
+	uint64 deadline_mono_us = 0;
+	uint64 frozen_deadline_mono_us;
+
+	reset_fixture();
+	/* A terminal legacy SOURCE row must not decide an active R4 wait. */
+	test_legacy_tt_found = true;
+	test_legacy_tt_status = CLUSTER_TT_STATUS_COMMITTED;
+	UT_ASSERT_EQ(cluster_tx_enqueue_wait_current_mx(&source, 1000,
+				 &deadline_mono_us),
+				 CLUSTER_TXW_RETRY);
+	UT_ASSERT(deadline_mono_us != 0);
+	frozen_deadline_mono_us = deadline_mono_us;
+	UT_ASSERT_EQ(test_legacy_tt_dispatch_calls, 0);
+	UT_ASSERT_EQ(test_wait_latch_calls, 1);
+	UT_ASSERT_EQ(test_wait_clear_calls, 1);
+	UT_ASSERT_EQ(test_wfg_exact_cancel_calls, 1);
+	assert_slot_clean();
+
+	/* A full tuple/DESCRIBE retry keeps the original operation deadline. */
+	UT_ASSERT_EQ(cluster_tx_enqueue_wait_current_mx(&source, 1000,
+				 &deadline_mono_us),
+				 CLUSTER_TXW_RETRY);
+	UT_ASSERT_EQ(deadline_mono_us, frozen_deadline_mono_us);
+	UT_ASSERT_EQ(test_legacy_tt_dispatch_calls, 0);
+	UT_ASSERT_EQ(test_wait_latch_calls, 2);
+	assert_slot_clean();
+
+	/* An exhausted retained budget times out after exact registration cleanup. */
+	deadline_mono_us = 1;
+	UT_ASSERT_EQ(cluster_tx_enqueue_wait_current_mx(&source, 1000,
+				 &deadline_mono_us),
+				 CLUSTER_TXW_TIMEOUT);
+	UT_ASSERT_EQ(deadline_mono_us, 1);
+	UT_ASSERT_EQ(test_legacy_tt_dispatch_calls, 0);
+	UT_ASSERT_EQ(test_wait_latch_calls, 2);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&ClusterTxw->timeout_count), 1);
 	assert_slot_clean();
 }
 
@@ -1454,7 +1502,7 @@ UT_TEST(test_backend_exit_counter_underflow_fails_stop_without_freeing_slot)
 int
 main(void)
 {
-	UT_PLAN(37);
+	UT_PLAN(38);
 	UT_RUN(test_exact_wait_abi_and_shmem_size_are_frozen);
 	UT_RUN(test_fixed_false_precedes_malformed_and_shared_state);
 	UT_RUN(test_initial_terminal_never_registers);
@@ -1471,6 +1519,7 @@ main(void)
 	UT_RUN(test_hint_waker_matches_source_discriminant_only);
 	UT_RUN(test_current_mx_waker_counts_only_current_source);
 	UT_RUN(test_current_mx_source_wait_consumes_deadlock_token_after_cleanup);
+	UT_RUN(test_current_mx_active_poll_retries_without_dormant_source);
 	UT_RUN(test_backend_exit_cleans_exact_target_and_allows_procno_reuse);
 	UT_RUN(test_backend_exit_cleans_exact_source_and_allows_procno_reuse);
 	UT_RUN(test_backend_exit_inactive_state_cleans_owned_slot_without_wfg_cancel);

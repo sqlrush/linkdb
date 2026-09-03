@@ -25,6 +25,7 @@
 #include "access/tableam.h"
 #include "cluster/cluster_scn.h"
 #include "cluster/cluster_tt_status.h"
+#include "cluster/cluster_tx_resolve.h"
 #include "nodes/lockoptions.h"
 
 
@@ -106,9 +107,23 @@ typedef enum ClusterUpdaterCandidateVerdict {
 } ClusterUpdaterCandidateVerdict;
 
 
+/* Page-derived identity of the successor's undo DATA record.  This is an
+ * echo/requalification alias only; its segment is not a canonical TT key. */
+typedef struct ClusterCurrentMxSuccessorAlias {
+	uint16 origin_node_id;
+	uint16 undo_record_segment_id;
+	uint32 tt_slot_id;
+	uint32 cluster_epoch;
+	TransactionId local_xid;
+	uint32 reserved32;
+	uint32 reserved32_2;
+} ClusterCurrentMxSuccessorAlias;
+
+
 typedef struct ClusterCurrentUpdaterProof {
 	ClusterCurrentMxKey mxkey;
-	ClusterTTStatusKey candidate_next_xmin_key;
+	ClusterCurrentMxSuccessorAlias candidate_next_xmin_alias;
+	ClusterTxLocator candidate_next_xmin_locator;
 	TransactionId updater_xid;
 	uint16 member_ordinal;
 	uint8 verdict;
@@ -117,7 +132,8 @@ typedef struct ClusterCurrentUpdaterProof {
 
 
 typedef struct ClusterCurrentUpdaterChallenge {
-	ClusterTTStatusKey candidate_next_xmin_key;
+	ClusterCurrentMxSuccessorAlias candidate_next_xmin_alias;
+	ClusterTxLocator candidate_next_xmin_locator;
 	TransactionId updater_xid;
 	uint16 member_ordinal;
 	uint16 reserved16;
@@ -192,6 +208,29 @@ typedef enum ClusterCurrentMxDecision {
 	CMDL_UNKNOWN,
 	CMDL_FOLLOW_UPDATED
 } ClusterCurrentMxDecision;
+
+
+typedef enum ClusterCurrentMxUnknownReason {
+	CMX_UNKNOWN_NONE = 0,
+	CMX_UNKNOWN_REQUEST_CONTEXT,
+	CMX_UNKNOWN_DESCRIPTOR,
+	CMX_UNKNOWN_TUPLE_SHAPE,
+	CMX_UNKNOWN_PROOFS_NULL,
+	CMX_UNKNOWN_PROOF_ENTRY,
+	CMX_UNKNOWN_STATUS_MODE,
+	CMX_UNKNOWN_SELF_XID,
+	CMX_UNKNOWN_MEMBER_STATE,
+	CMX_UNKNOWN_COMMITTED_UPDATER_SHAPE,
+	CMX_UNKNOWN_COMMITTED_UPDATER_PROOF,
+	CMX_UNKNOWN_ACTIVE_UPDATER_SHAPE,
+	CMX_UNKNOWN_ACTIVE_UPDATER_PROOF
+} ClusterCurrentMxUnknownReason;
+
+
+typedef struct ClusterCurrentMxDecisionTrace {
+	ClusterCurrentMxUnknownReason unknown_reason;
+	int32 member_ordinal;
+} ClusterCurrentMxDecisionTrace;
 
 
 /*
@@ -287,10 +326,12 @@ StaticAssertDecl(sizeof(ClusterCurrentMxMemberDesc) == 8,
 				 "ClusterCurrentMxMemberDesc must remain 8 bytes");
 StaticAssertDecl(sizeof(ClusterCurrentMemberProof) == 48,
 				 "ClusterCurrentMemberProof must remain 48 bytes");
-StaticAssertDecl(sizeof(ClusterCurrentUpdaterProof) == 48,
-				 "ClusterCurrentUpdaterProof must remain 48 bytes");
-StaticAssertDecl(sizeof(ClusterCurrentUpdaterChallenge) == 32,
-				 "ClusterCurrentUpdaterChallenge must remain 32 bytes");
+StaticAssertDecl(sizeof(ClusterCurrentMxSuccessorAlias) == 24,
+				 "ClusterCurrentMxSuccessorAlias must remain 24 bytes");
+StaticAssertDecl(sizeof(ClusterCurrentUpdaterProof) == 72,
+				 "ClusterCurrentUpdaterProof must remain 72 bytes");
+StaticAssertDecl(sizeof(ClusterCurrentUpdaterChallenge) == 56,
+				 "ClusterCurrentUpdaterChallenge must remain 56 bytes");
 
 
 extern ClusterMxDescribeResult cluster_multixact_current_validate_descriptor(
@@ -315,6 +356,10 @@ extern ClusterUpdaterCandidateVerdict cluster_multixact_current_updater_candidat
 	const ClusterTTStatusKey *candidate, TransactionId updater_xid,
 	uint16 updater_origin_node, uint32 current_epoch, ClusterTTStatusKey *current_binding,
 	ClusterTTStatusResult *current_result);
+extern bool cluster_multixact_current_successor_provenance_well_formed(
+	const ClusterCurrentMxSuccessorAlias *alias,
+	const ClusterTxLocator *locator, TransactionId updater_xid,
+	uint16 updater_origin_node, uint32 current_epoch);
 extern bool cluster_multixact_current_validate_updater_proof(
 	const ClusterCurrentMxKey *key, const ClusterCurrentMxMemberDesc *members,
 	const ClusterCurrentMemberProof *proofs, uint16 nmembers,
@@ -327,6 +372,12 @@ extern ClusterCurrentMxDecision cluster_multixact_current_decide(
 	uint16 nmembers, const ClusterCurrentMxRequestContext *ctx,
 	const ClusterCurrentUpdaterChallenge *challenge,
 	const ClusterCurrentUpdaterProof *updater_proof, ClusterTTStatusKey *wait_key);
+extern ClusterCurrentMxDecision cluster_multixact_current_decide_observed(
+	const ClusterCurrentMxMemberDesc *members, const ClusterCurrentMemberProof *proofs,
+	uint16 nmembers, const ClusterCurrentMxRequestContext *ctx,
+	const ClusterCurrentUpdaterChallenge *challenge,
+	const ClusterCurrentUpdaterProof *updater_proof, ClusterTTStatusKey *wait_key,
+	ClusterCurrentMxDecisionTrace *trace);
 
 extern ClusterMxDescribeResult
 cluster_multixact_current_describe(const ClusterCurrentMxKey *key,

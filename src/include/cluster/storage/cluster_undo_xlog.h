@@ -44,6 +44,7 @@
 
 #include "cluster/cluster_itl_slot.h" /* UBA (spec-4.8 D7-A xl_undo_tt_slot_set_head) */
 #include "cluster/cluster_scn.h"	  /* SCN typedef (spec-3.11 D3 xl_undo_tt_slot_commit) */
+#include "cluster/cluster_tt_slot.h" /* TTSlot + CTRC release flag */
 #include "cluster/cluster_undo_format.h" /* UndoBlockHeader/UndoSlotDirEntry (spec-3.18 D2 block_write) */
 
 
@@ -71,9 +72,8 @@
 #define XLOG_UNDO_TT_SLOT_SET_HEAD                                                                 \
 	0x90 /* spec-4.8 D7-A: durably set TTSlot.first_undo_block (undo-chain head) from the 2PC       \
 		  * record at ROLLBACK PREPARED, so D7 physical rollback can walk it after crash-restart */
-/* spec-5.7a D1 (§3.1a M1c; amend #3): HW relation-extend authority durable record.
- * amend #3 removed HW_SEED (authority owns from block 0; HW_RESERVE is the only
- * HWM source).  0xA0 is therefore free again. */
+#define XLOG_UNDO_TT_SLOT_CTRC_RELEASE 0xA0
+/* spec-5.7a D1 (§3.1a M1c; amend #3): HW relation-extend authority durable record. */
 #define XLOG_HW_RESERVE 0xB0 /* per-batch HWM advance, flushed before the master replies */
 
 StaticAssertDecl((XLOG_UNDO_SEGMENT_INIT & XLR_INFO_MASK) == 0,
@@ -91,6 +91,8 @@ StaticAssertDecl((XLOG_UNDO_TT_SLOT_ABORT & XLR_INFO_MASK) == 0,
 StaticAssertDecl((XLOG_UNDO_BLOCK_WRITE & XLR_INFO_MASK) == 0,
 				 "cluster undo WAL opcodes must leave XLR_INFO_MASK bits clear");
 StaticAssertDecl((XLOG_UNDO_TT_SLOT_SET_HEAD & XLR_INFO_MASK) == 0,
+				 "cluster undo WAL opcodes must leave XLR_INFO_MASK bits clear");
+StaticAssertDecl((XLOG_UNDO_TT_SLOT_CTRC_RELEASE & XLR_INFO_MASK) == 0,
 				 "cluster undo WAL opcodes must leave XLR_INFO_MASK bits clear");
 StaticAssertDecl((XLOG_HW_RESERVE & XLR_INFO_MASK) == 0,
 				 "cluster undo WAL opcodes must leave XLR_INFO_MASK bits clear");
@@ -281,6 +283,225 @@ typedef struct xl_undo_tt_slot_set_head {
 
 StaticAssertDecl(sizeof(xl_undo_tt_slot_set_head) == 32,
 				 "spec-4.8 D7-A: xl_undo_tt_slot_set_head is 32 bytes, no implicit padding");
+
+/* Spec 8.4D §12.10: field-coded canonical terminal-reference release
+ * certificate.  The struct is the decoded logical form; WAL always carries
+ * the exact little-endian 96-byte encoding produced below. */
+#define CLUSTER_UNDO_TT_CTRC_RELEASE_VERSION UINT8_C(1)
+#define CLUSTER_UNDO_TT_CTRC_RELEASE_ALL_TOUCHED_ACKED UINT8_C(0x01)
+#define CLUSTER_UNDO_TT_CTRC_RELEASE_BYTES 96
+
+typedef struct xl_undo_tt_slot_ctrc_release_v1
+{
+	uint32 segment_id;
+	uint32 segment_generation;
+	TransactionId xid;
+	uint32 cluster_epoch;
+	uint64 root_id;
+	uint64 root_generation;
+	uint64 formation_epoch;
+	uint64 admission_record_generation;
+	uint64 seal_generation;
+	uint64 touched_nodes_low;
+	uint64 touched_nodes_high;
+	uint8 ack_set_digest[16];
+	uint16 slot_offset;
+	uint16 slot_wrap;
+	uint8 owner_instance;
+	uint8 terminal_status;
+	uint8 format_version;
+	uint8 flags;
+} xl_undo_tt_slot_ctrc_release_v1;
+
+StaticAssertDecl(sizeof(xl_undo_tt_slot_ctrc_release_v1)
+				 == CLUSTER_UNDO_TT_CTRC_RELEASE_BYTES,
+				 "CTRC release WAL payload must remain exactly 96 bytes");
+StaticAssertDecl(offsetof(xl_undo_tt_slot_ctrc_release_v1,
+						  ack_set_digest) == 72,
+				 "CTRC release digest offset must remain fixed");
+StaticAssertDecl(offsetof(xl_undo_tt_slot_ctrc_release_v1,
+						  slot_offset) == 88,
+				 "CTRC release identity trailer offset must remain fixed");
+
+static inline void
+cluster_undo_tt_ctrc_put_u16_le(uint8 *bytes, uint16 value)
+{
+	bytes[0] = (uint8)value;
+	bytes[1] = (uint8)(value >> 8);
+}
+
+static inline void
+cluster_undo_tt_ctrc_put_u32_le(uint8 *bytes, uint32 value)
+{
+	bytes[0] = (uint8)value;
+	bytes[1] = (uint8)(value >> 8);
+	bytes[2] = (uint8)(value >> 16);
+	bytes[3] = (uint8)(value >> 24);
+}
+
+static inline void
+cluster_undo_tt_ctrc_put_u64_le(uint8 *bytes, uint64 value)
+{
+	int i;
+
+	for (i = 0; i < 8; i++)
+		bytes[i] = (uint8)(value >> (i * 8));
+}
+
+static inline uint16
+cluster_undo_tt_ctrc_get_u16_le(const uint8 *bytes)
+{
+	return (uint16)bytes[0] | ((uint16)bytes[1] << 8);
+}
+
+static inline uint32
+cluster_undo_tt_ctrc_get_u32_le(const uint8 *bytes)
+{
+	return (uint32)bytes[0] | ((uint32)bytes[1] << 8)
+		| ((uint32)bytes[2] << 16) | ((uint32)bytes[3] << 24);
+}
+
+static inline uint64
+cluster_undo_tt_ctrc_get_u64_le(const uint8 *bytes)
+{
+	uint64 value = 0;
+	int i;
+
+	for (i = 0; i < 8; i++)
+		value |= ((uint64)bytes[i]) << (i * 8);
+	return value;
+}
+
+static inline bool
+cluster_undo_tt_ctrc_release_valid(
+	const xl_undo_tt_slot_ctrc_release_v1 *record)
+{
+	return record != NULL && record->segment_id != 0
+		&& TransactionIdIsNormal(record->xid)
+		&& record->root_id != 0 && record->root_generation != 0
+		&& record->admission_record_generation != 0
+		&& record->seal_generation != 0
+		&& record->touched_nodes_high == 0
+		&& (record->touched_nodes_low & ~UINT64_C(0xffff)) == 0
+		&& record->slot_offset < TT_SLOTS_PER_SEGMENT
+		&& record->slot_wrap != TT_WRAP_INVALID
+		&& record->owner_instance != 0 && record->owner_instance <= 128
+		&& (record->terminal_status == TT_SLOT_COMMITTED
+			|| record->terminal_status == TT_SLOT_ABORTED)
+		&& record->format_version
+		   == CLUSTER_UNDO_TT_CTRC_RELEASE_VERSION
+		&& record->flags
+		   == CLUSTER_UNDO_TT_CTRC_RELEASE_ALL_TOUCHED_ACKED;
+}
+
+static inline bool
+cluster_undo_tt_ctrc_release_encode(
+	const xl_undo_tt_slot_ctrc_release_v1 *record,
+	uint8 bytes[CLUSTER_UNDO_TT_CTRC_RELEASE_BYTES])
+{
+	if (bytes != NULL)
+		memset(bytes, 0, CLUSTER_UNDO_TT_CTRC_RELEASE_BYTES);
+	if (bytes == NULL || !cluster_undo_tt_ctrc_release_valid(record))
+		return false;
+	cluster_undo_tt_ctrc_put_u32_le(bytes + 0, record->segment_id);
+	cluster_undo_tt_ctrc_put_u32_le(bytes + 4,
+		record->segment_generation);
+	cluster_undo_tt_ctrc_put_u32_le(bytes + 8, record->xid);
+	cluster_undo_tt_ctrc_put_u32_le(bytes + 12, record->cluster_epoch);
+	cluster_undo_tt_ctrc_put_u64_le(bytes + 16, record->root_id);
+	cluster_undo_tt_ctrc_put_u64_le(bytes + 24, record->root_generation);
+	cluster_undo_tt_ctrc_put_u64_le(bytes + 32, record->formation_epoch);
+	cluster_undo_tt_ctrc_put_u64_le(bytes + 40,
+		record->admission_record_generation);
+	cluster_undo_tt_ctrc_put_u64_le(bytes + 48, record->seal_generation);
+	cluster_undo_tt_ctrc_put_u64_le(bytes + 56, record->touched_nodes_low);
+	cluster_undo_tt_ctrc_put_u64_le(bytes + 64, record->touched_nodes_high);
+	memcpy(bytes + 72, record->ack_set_digest,
+		sizeof(record->ack_set_digest));
+	cluster_undo_tt_ctrc_put_u16_le(bytes + 88, record->slot_offset);
+	cluster_undo_tt_ctrc_put_u16_le(bytes + 90, record->slot_wrap);
+	bytes[92] = record->owner_instance;
+	bytes[93] = record->terminal_status;
+	bytes[94] = record->format_version;
+	bytes[95] = record->flags;
+	return true;
+}
+
+static inline bool
+cluster_undo_tt_ctrc_release_decode(
+	const uint8 bytes[CLUSTER_UNDO_TT_CTRC_RELEASE_BYTES],
+	xl_undo_tt_slot_ctrc_release_v1 *record_out)
+{
+	xl_undo_tt_slot_ctrc_release_v1 record;
+
+	if (record_out != NULL)
+		memset(record_out, 0, sizeof(*record_out));
+	if (bytes == NULL || record_out == NULL)
+		return false;
+	memset(&record, 0, sizeof(record));
+	record.segment_id = cluster_undo_tt_ctrc_get_u32_le(bytes + 0);
+	record.segment_generation
+		= cluster_undo_tt_ctrc_get_u32_le(bytes + 4);
+	record.xid = cluster_undo_tt_ctrc_get_u32_le(bytes + 8);
+	record.cluster_epoch = cluster_undo_tt_ctrc_get_u32_le(bytes + 12);
+	record.root_id = cluster_undo_tt_ctrc_get_u64_le(bytes + 16);
+	record.root_generation = cluster_undo_tt_ctrc_get_u64_le(bytes + 24);
+	record.formation_epoch = cluster_undo_tt_ctrc_get_u64_le(bytes + 32);
+	record.admission_record_generation
+		= cluster_undo_tt_ctrc_get_u64_le(bytes + 40);
+	record.seal_generation = cluster_undo_tt_ctrc_get_u64_le(bytes + 48);
+	record.touched_nodes_low = cluster_undo_tt_ctrc_get_u64_le(bytes + 56);
+	record.touched_nodes_high = cluster_undo_tt_ctrc_get_u64_le(bytes + 64);
+	memcpy(record.ack_set_digest, bytes + 72,
+		sizeof(record.ack_set_digest));
+	record.slot_offset = cluster_undo_tt_ctrc_get_u16_le(bytes + 88);
+	record.slot_wrap = cluster_undo_tt_ctrc_get_u16_le(bytes + 90);
+	record.owner_instance = bytes[92];
+	record.terminal_status = bytes[93];
+	record.format_version = bytes[94];
+	record.flags = bytes[95];
+	if (!cluster_undo_tt_ctrc_release_valid(&record))
+		return false;
+	*record_out = record;
+	return true;
+}
+
+typedef enum ClusterUndoTtCtrcReleaseRedoDecision
+{
+	CLUSTER_UNDO_TT_CTRC_RELEASE_REDO_APPLY = 0,
+	CLUSTER_UNDO_TT_CTRC_RELEASE_REDO_IDEMPOTENT,
+	CLUSTER_UNDO_TT_CTRC_RELEASE_REDO_SKIP_STALE,
+	CLUSTER_UNDO_TT_CTRC_RELEASE_REDO_CONFLICT
+} ClusterUndoTtCtrcReleaseRedoDecision;
+
+static inline ClusterUndoTtCtrcReleaseRedoDecision
+cluster_undo_tt_ctrc_release_redo_decide(uint32 disk_generation,
+	const TTSlot *slot, const xl_undo_tt_slot_ctrc_release_v1 *record)
+{
+	if (slot == NULL || !cluster_undo_tt_ctrc_release_valid(record))
+		return CLUSTER_UNDO_TT_CTRC_RELEASE_REDO_CONFLICT;
+	if (disk_generation > record->segment_generation)
+		return CLUSTER_UNDO_TT_CTRC_RELEASE_REDO_SKIP_STALE;
+	if (disk_generation < record->segment_generation)
+		return CLUSTER_UNDO_TT_CTRC_RELEASE_REDO_CONFLICT;
+	if (slot->wrap > record->slot_wrap)
+		return CLUSTER_UNDO_TT_CTRC_RELEASE_REDO_SKIP_STALE;
+	if (slot->wrap < record->slot_wrap || slot->xid != record->xid
+		|| slot->status != record->terminal_status
+		|| (slot->flags & ~TT_SLOT_FLAGS_KNOWN) != 0
+		|| (slot->status == TT_SLOT_COMMITTED) != SCN_VALID(slot->commit_scn))
+		return CLUSTER_UNDO_TT_CTRC_RELEASE_REDO_CONFLICT;
+	return (slot->flags & TT_SLOT_FLAG_CTRC_RELEASE_PROVEN) != 0
+		? CLUSTER_UNDO_TT_CTRC_RELEASE_REDO_IDEMPOTENT
+		: CLUSTER_UNDO_TT_CTRC_RELEASE_REDO_APPLY;
+}
+
+/* Shared cold/online exact block-0 primitive for the decoded 0xA0 record. */
+extern ClusterUndoTtCtrcReleaseRedoDecision
+cluster_tt_durable_ctrc_release_preflight_exact(
+	const xl_undo_tt_slot_ctrc_release_v1 *record);
+extern void cluster_tt_durable_redo_ctrc_release_slot_exact(
+	const xl_undo_tt_slot_ctrc_release_v1 *record);
 
 /*
  * On-disk WAL payload for XLOG_UNDO_SEGMENT_RECYCLE (spec-3.13 D3).
@@ -580,8 +801,13 @@ extern XLogRecPtr cluster_undo_emit_tt_slot_abort_exact(uint8 instance,
 
 /* spec-4.8 D7-A: emit XLOG_UNDO_TT_SLOT_SET_HEAD (durable undo-chain head). */
 extern XLogRecPtr cluster_undo_emit_tt_slot_set_head(uint8 instance, uint32 segment_id,
-													 uint16 slot_offset, uint16 wrap,
-													 TransactionId xid, UBA first_undo_block);
+												 uint16 slot_offset, uint16 wrap,
+												 TransactionId xid, UBA first_undo_block);
+
+/* Spec 8.4D: insert the exact 96-byte CTRC release certificate.  The caller
+ * must flush the returned LSN before publishing the release bit. */
+extern XLogRecPtr cluster_undo_xlog_insert_tt_ctrc_release(
+	const xl_undo_tt_slot_ctrc_release_v1 *record);
 
 /* spec-3.13 D3: emit XLOG_UNDO_SEGMENT_RECYCLE (caller XLogFlush + pwrite + fsync). */
 extern XLogRecPtr cluster_undo_emit_segment_recycle(uint8 instance, uint32 segment_id,

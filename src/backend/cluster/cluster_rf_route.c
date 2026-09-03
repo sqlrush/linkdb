@@ -95,8 +95,8 @@ enum
 
 StaticAssertDecl(RF_OPCODE_ROUTE_MANIFEST_COUNT_V1 == 138,
 				 "STOP-06 manifest must contain exactly 138 rows");
-StaticAssertDecl(RF_OPCODE_ROUTE_MANIFEST_LIVE_COUNT_V1 == 137,
-				 "STOP-06 manifest must contain exactly 137 live rows");
+StaticAssertDecl(RF_OPCODE_ROUTE_MANIFEST_LIVE_COUNT_V1 == 138,
+				 "STOP-06 manifest must contain exactly 138 live rows");
 StaticAssertDecl(lengthof(rf_opcode_route_manifest_v1) ==
 				 RF_OPCODE_ROUTE_MANIFEST_COUNT_V1,
 				 "STOP-06 generated table count must match manifest count");

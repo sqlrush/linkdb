@@ -52,9 +52,13 @@ typedef struct ClusterHeapSuccessorProof
 	ItemPointerData tid;
 	TransactionId updater_xid;
 	uint16		origin_node_id;
-	uint16		undo_segment_id;
+	uint16		undo_record_segment_id;
 	uint32		tt_slot_id;
 	uint32		cluster_epoch;
+	uint64		locator_uba_raw[2];
+	uint16		locator_tt_wrap;
+	uint8		locator_itl_kind;
+	uint8		locator_itl_slot_index;
 	bool		valid;
 } ClusterHeapSuccessorProof;
 #endif

@@ -23,7 +23,7 @@
 #include "cluster/cluster_multixact_current.h"
 
 #define CLUSTER_CURRENT_MX_WIRE_MAGIC ((uint32)0x5047434d)
-#define CLUSTER_CURRENT_MX_WIRE_VERSION 2
+#define CLUSTER_CURRENT_MX_WIRE_VERSION 3
 #define CLUSTER_CURRENT_MX_WIRE_FLAGS_NONE 0
 #define CLUSTER_CURRENT_MX_DESCRIBE_FORWARD_SIZE 128
 #define CLUSTER_CURRENT_MX_PROOF_FORWARD_SIZE 128
@@ -65,7 +65,8 @@ typedef struct ClusterCurrentMxProofAskWire {
 } ClusterCurrentMxProofAskWire;
 
 typedef struct ClusterCurrentMxUpdaterChallengeWire {
-	ClusterTTStatusKey candidate_next_xmin_key;
+	ClusterCurrentMxSuccessorAlias candidate_next_xmin_alias;
+	ClusterTxLocator candidate_next_xmin_locator;
 	TransactionId updater_xid;
 	uint16 member_ordinal;
 	uint8 member_status;
@@ -74,7 +75,6 @@ typedef struct ClusterCurrentMxUpdaterChallengeWire {
 
 typedef struct ClusterCurrentMxUpdaterChallengeBodyWire {
 	ClusterCurrentMxUpdaterChallengeWire challenge;
-	uint8 reserved[24];
 } ClusterCurrentMxUpdaterChallengeBodyWire;
 
 typedef union ClusterCurrentMxProofRequestBodyWire {
@@ -213,8 +213,8 @@ StaticAssertDecl(sizeof(ClusterCurrentMxDescribeForwardV2)
 				 "current MX describe forward must remain 128 bytes");
 StaticAssertDecl(sizeof(ClusterCurrentMxProofAskWire) == 8,
 				 "current MX proof ask must remain 8 bytes");
-StaticAssertDecl(sizeof(ClusterCurrentMxUpdaterChallengeWire) == 32,
-				 "current MX updater challenge wire must remain 32 bytes");
+StaticAssertDecl(sizeof(ClusterCurrentMxUpdaterChallengeWire) == 56,
+				 "current MX updater challenge wire must remain 56 bytes");
 StaticAssertDecl(sizeof(ClusterCurrentMxUpdaterChallengeBodyWire) == 56,
 				 "current MX updater challenge body must remain 56 bytes");
 StaticAssertDecl(sizeof(ClusterCurrentMxProofRequestBodyWire) == 56,

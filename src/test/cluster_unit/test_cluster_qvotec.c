@@ -71,6 +71,7 @@
 #include "cluster/cluster_replacement_request.h"
 #include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_sf_dep.h"
+#include "cluster/cluster_terminal_ref_census.h"
 #include "cluster/cluster_undo_smgr.h"
 #include "cluster/cluster_undo_root_descriptor.h"
 #include "cluster/cluster_write_fence.h" /* ClusterFenceMarker for D2/D4 stubs */
@@ -172,6 +173,12 @@ char *cluster_shared_data_dir = NULL;
  * test_cluster_r4_activation_fsm test_130. */
 bool
 cluster_wal_state_correctness_census_ok(void)
+{
+	return true;
+}
+
+bool
+cluster_ctrc_shmem_ready(void)
 {
 	return true;
 }

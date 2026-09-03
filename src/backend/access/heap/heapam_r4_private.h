@@ -22,6 +22,9 @@
 #include "access/multixact.h"
 #include "access/tableam.h"
 #include "cluster/cluster_scn.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_undo_record_api.h"
+#endif
 #include "executor/tuptable.h"
 #include "storage/buf_internals.h"
 #include "storage/bufpage.h"
@@ -86,8 +89,21 @@ typedef struct ClusterHeapNoRetryTestReport
 	uint8 preflight_calls;
 	uint8 apply_calls;
 	uint8 consume_calls;
+	uint8 last_preflight_event;
+	uint8 first_apply_event;
+	uint8 last_apply_event;
+	uint8 consume_event;
+	uint8 retained_undo_handle_count;
 	bool retry_edge;
 } ClusterHeapNoRetryTestReport;
+
+typedef struct ClusterHeapPrepareRetryTestReport
+{
+	uint8 prepare_calls;
+	bool deadline_stable;
+	uint64 observed_deadline_us;
+	ClusterUndoRecordPrepareResult terminal_result;
+} ClusterHeapPrepareRetryTestReport;
 
 typedef enum ClusterHeapMultiInsertRoute
 {
@@ -137,17 +153,24 @@ extern bool cluster_heap_test_dml_authority_guard_slot_recheck_with_hook(
 extern bool cluster_heap_test_no_retry_boundary(
 	ClusterHeapNoRetryTestCaller caller, bool final_recheck_drift,
 	bool partial_apply_failure, ClusterHeapNoRetryTestReport *report);
+extern bool cluster_heap_test_prepare_retry_sequence(
+	const ClusterUndoRecordPrepareResult *results, uint8 result_count,
+	uint64 absolute_deadline_us, ClusterHeapPrepareRetryTestReport *report);
 extern bool cluster_heap_test_itl_receipt_identity_admitted(
 	TransactionId canonical_xid, uint32 segment_id);
 extern ClusterHeapMultiInsertRoute cluster_heap_test_multi_insert_route(
 	bool current_itl_path);
 extern bool cluster_heap_test_update_needs_successor_prediction(
 	bool current_itl_path, bool current_mx_recomposed);
+extern bool cluster_heap_test_itl_relation_route(
+	bool storage_mode, bool uses_local_buffers, bool shared_catalog,
+	RelFileNumber rel_number);
 extern bool cluster_heap_test_current_mx_authorize_keyshare(
 	Relation relation, Buffer buffer, HeapTuple tuple,
 	TransactionId requester_xid, TM_Result *result,
 	MultiXactMember *normalized, uint16 normalized_cap,
 	uint16 *normalized_count);
+extern bool cluster_heap_test_current_mx_epoch_supported(uint64 epoch);
 #endif
 #endif
 

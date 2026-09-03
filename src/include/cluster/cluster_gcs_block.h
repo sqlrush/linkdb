@@ -74,6 +74,7 @@
 #include "cluster/cluster_pcm_x_bufmgr.h"
 #include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_sf_dep.h" /* ClusterSfDepVec / max origins */
+#include "cluster/cluster_terminal_ref_census.h"
 #include "cluster/cluster_tx_resolve.h"
 #include "storage/block.h"			/* BLCKSZ */
 #include "storage/buf_internals.h"	/* BufferTag, BufferDesc */
@@ -224,6 +225,55 @@ cluster_gcs_resource_x_target_pending_terminal_resample_exact(
 		&& round->retired_acquisition_generation
 			== round->ref.acquisition_generation
 		&& round->progress_flags == 0;
+}
+
+/* A legacy local acquire and the target-only Resource-X driver serialize
+ * through the same BufferDesc reservation word.  The driver can sample any
+ * edge of one unrelated reversible N reservation: clean->GRANT_PENDING,
+ * GRANT_PENDING->clean, or a complete clean->clean token advance.  None
+ * grants authority or carries page proof.  Accept only an unchanged N
+ * generation, monotone token and zero activation fields, then permit one
+ * bounded sleep/reprobe under the caller's original R7 deadline.  The next
+ * iteration validates the successor through its canonical predicate. */
+static inline bool
+cluster_gcs_resource_x_target_local_n_reservation_retry_exact(
+	const ClusterPcmOwnSnapshot *before,
+	ClusterPcmOwnResult live_result,
+	const ClusterPcmOwnSnapshot *live,
+	uint64 now_us, uint64 absolute_deadline_us)
+{
+	bool before_pending;
+
+	if (before == NULL || live == NULL
+		|| now_us == 0 || now_us == UINT64_MAX
+		|| absolute_deadline_us == 0
+		|| absolute_deadline_us == UINT64_MAX
+		|| now_us >= absolute_deadline_us)
+		return false;
+	before_pending = before->flags == PCM_OWN_FLAG_GRANT_PENDING;
+	if ((!before_pending && before->flags != 0)
+		|| live_result != (before_pending
+			? CLUSTER_PCM_OWN_OK : CLUSTER_PCM_OWN_STALE)
+		|| !BufferTagsEqual(&before->tag, &live->tag)
+		|| before->pcm_state != (uint8) PCM_STATE_N
+		|| live->pcm_state != (uint8) PCM_STATE_N
+		|| (live->flags != 0
+			&& live->flags != PCM_OWN_FLAG_GRANT_PENDING)
+		|| before->generation == UINT64_MAX
+		|| live->generation != before->generation
+		|| before->reservation_token == UINT64_MAX
+		|| live->reservation_token == UINT64_MAX
+		|| before->writer_activation_token != 0
+		|| live->writer_activation_token != 0
+		|| before->resource_x_activation_generation != 0
+		|| live->resource_x_activation_generation != 0)
+		return false;
+	if (before_pending)
+		return before->reservation_token != 0
+			&& live->reservation_token >= before->reservation_token
+			&& (live->flags == 0 || live->reservation_token != 0);
+	return live->reservation_token > before->reservation_token
+		&& (live->flags == 0 || live->reservation_token != 0);
 }
 
 /* A direct-init reservation remains non-authoritative.  Durable storage is
@@ -850,7 +900,8 @@ typedef enum GcsBlockReplyStatus {
 	GCS_BLOCK_REPLY_R4_DENIED = 26,
 	GCS_BLOCK_REPLY_CURRENT_MX_DESCRIBE_RESULT = 27,
 	GCS_BLOCK_REPLY_CURRENT_MX_MEMBER_PROOF_RESULT = 28,
-	GCS_BLOCK_REPLY_CURRENT_MX_STATS_RESULT = 29
+	GCS_BLOCK_REPLY_CURRENT_MX_STATS_RESULT = 29,
+	GCS_BLOCK_REPLY_CURRENT_MX_CTRC_SEAL_RESULT = 30
 } GcsBlockReplyStatus;
 
 /*
@@ -907,7 +958,10 @@ StaticAssertDecl(GCS_BLOCK_REPLY_CURRENT_MX_MEMBER_PROOF_RESULT
 				 "current MX member-proof result must follow describe");
 StaticAssertDecl(GCS_BLOCK_REPLY_CURRENT_MX_STATS_RESULT
 					 == GCS_BLOCK_REPLY_CURRENT_MX_MEMBER_PROOF_RESULT + 1,
-				 "current MX stats result must remain the reserved tail status");
+				 "current MX stats result must follow member proof");
+StaticAssertDecl(GCS_BLOCK_REPLY_CURRENT_MX_CTRC_SEAL_RESULT
+					 == GCS_BLOCK_REPLY_CURRENT_MX_STATS_RESULT + 1,
+				 "CTRC seal result must remain the appended tail status");
 
 /* PGRAC adaptation: R4 owns one closed status suffix.  Keep the domain
  * predicates numeric so legacy and R4 decoders cannot accept each other's
@@ -3049,10 +3103,14 @@ GcsBlockForwardPayloadSetDirectLandFromRequest(GcsBlockForwardPayload *fwd,
  * shipped value 3; only this unshipped-on-main sub-kind moves.
  */
 #define GCS_BLOCK_FORWARD_KIND_UNDO_FRESHREF_C1B_PAIR ((uint8)10)
+#define GCS_BLOCK_FORWARD_KIND_CURRENT_MX_CTRC_SEAL ((uint8)11)
 
 StaticAssertDecl(GCS_BLOCK_FORWARD_KIND_UNDO_FRESHREF_C1B_PAIR
 					 > GCS_BLOCK_FORWARD_KIND_CURRENT_MX_DESCRIBE,
 				 "fresh-ref C1b pair kind must not collide with kinds 1..9");
+StaticAssertDecl(GCS_BLOCK_FORWARD_KIND_CURRENT_MX_CTRC_SEAL
+					 == GCS_BLOCK_FORWARD_KIND_UNDO_FRESHREF_C1B_PAIR + 1,
+				 "CTRC seal request kind must remain appended after fresh-ref");
 
 static inline void
 GcsBlockForwardPayloadSetUndoVerdictRequest(GcsBlockForwardPayload *p, bool authoritative)
@@ -4538,6 +4596,8 @@ extern void cluster_gcs_block_on_epoch_advance(uint64 new_epoch);
 extern void cluster_gcs_block_on_epoch_advance_exact(
 	uint64 new_epoch, const uint8 *dead_bitmap);
 extern bool cluster_gcs_block_resource_x_cutover_tick(void);
+extern bool cluster_gcs_ctrc_dispatch_close(
+	const ClusterCtrcCloseDispatch *dispatch);
 
 
 /* ============================================================

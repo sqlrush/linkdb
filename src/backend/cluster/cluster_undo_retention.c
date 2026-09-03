@@ -93,8 +93,10 @@ cluster_tt_slot_recyclable(uint8 cts_status, SCN commit_scn, SCN horizon)
  *	Precondition: SEGMENT_COMMITTED (C5).  The segment's retention watermark is
  *	the max commit_scn over the COMMITTED on-disk TT slots in its header; the
  *	segment is recyclable only when that watermark is strictly below horizon.
- *	In peer mode, any canonical ABORTED slot retains the segment until an exact
- *	distributed reference-release owner exists.
+ *	In peer mode, every terminal slot additionally requires the exact durable
+ *	CTRC release bit.  COMMITTED retains its valid folded-horizon gate; ABORTED
+ *	requires no invented time horizon.  Unknown/illegal flags or status shapes
+ *	retain the whole segment.
  */
 bool
 cluster_undo_segment_recyclable_for_mode(const struct UndoSegmentHeaderData *hdr,
@@ -118,9 +120,38 @@ cluster_undo_segment_recyclable_for_mode(const struct UndoSegmentHeaderData *hdr
 
 	if (peer_mode) {
 		for (i = 0; i < TT_SLOTS_PER_SEGMENT; i++) {
-			if (hdr->tt_slots[i].status == TT_SLOT_ABORTED)
+			const TTSlot *s = &hdr->tt_slots[i];
+
+			switch (s->status) {
+			case TT_SLOT_COMMITTED:
+				if (!TransactionIdIsNormal(s->xid)
+					|| s->wrap == TT_WRAP_INVALID
+					|| s->flags != TT_SLOT_FLAG_CTRC_RELEASE_PROVEN
+					|| !UBA_is_invalid(s->first_undo_block)
+					|| !SCN_VALID(s->commit_scn)
+					|| !SCN_VALID(horizon)
+					|| scn_time_cmp(s->commit_scn, horizon) > 0)
+					return false;
+				break;
+			case TT_SLOT_ABORTED:
+				if (!TransactionIdIsNormal(s->xid)
+					|| s->wrap == TT_WRAP_INVALID
+					|| s->flags != TT_SLOT_FLAG_CTRC_RELEASE_PROVEN
+					|| !UBA_is_invalid(s->first_undo_block)
+					|| s->commit_scn != InvalidScn)
+					return false;
+				break;
+			case TT_SLOT_UNUSED:
+			case TT_SLOT_RECYCLABLE:
+				if (s->flags != TT_FLAGS_RESERVED)
+					return false;
+				break;
+			case TT_SLOT_ACTIVE:
+			default:
 				return false;
+			}
 		}
+		return true;
 	}
 
 	/* InvalidScn horizon == cluster disabled -> no retention constraint. */

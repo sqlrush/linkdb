@@ -86,6 +86,12 @@ typedef enum ClusterUndoRecordConsumeResult {
 	CLUSTER_UNDO_RECORD_CONSUME_REFUSED
 } ClusterUndoRecordConsumeResult;
 
+typedef enum ClusterUndoRecordConsumePreflightResult {
+	CLUSTER_UNDO_RECORD_CONSUME_PREFLIGHT_READY = 0,
+	CLUSTER_UNDO_RECORD_CONSUME_PREFLIGHT_RETRY_REQUIRED,
+	CLUSTER_UNDO_RECORD_CONSUME_PREFLIGHT_REFUSED
+} ClusterUndoRecordConsumePreflightResult;
+
 #define CLUSTER_UNDO_RECORD_CTRC_TARGETS 2
 
 /* Stack-only identity for one backend-local prepared DATA reservation.  It is
@@ -111,7 +117,8 @@ typedef struct ClusterUndoRecordPrepareReceipt {
 	uint8 ctrc_pending_mask;
 	uint8 ctrc_prepared_mask;
 	uint8 ctrc_applied_mask;
-	uint8 ctrc_reserved8[5];
+	uint8 ctrc_reuse_mask;
+	uint8 ctrc_reserved8[4];
 } ClusterUndoRecordPrepareReceipt;
 
 extern uint64 cluster_undo_record_prepare_deadline_us(void);
@@ -129,6 +136,9 @@ extern bool cluster_undo_record_ctrc_stage_pending(
 	const ClusterCtrcTargetV1 *pending_target);
 extern bool cluster_undo_record_ctrc_prepare_pending(
 	ClusterUndoRecordPrepareReceipt *receipt, uint8 target_ordinal);
+extern bool cluster_undo_record_ctrc_stage_reuse(
+	ClusterUndoRecordPrepareReceipt *receipt, uint8 target_ordinal,
+	const ClusterCtrcReceiptHandle *handle);
 extern bool cluster_undo_record_ctrc_pending_matches(
 	const ClusterUndoRecordPrepareReceipt *receipt, uint8 target_ordinal,
 	const ClusterCtrcTargetV1 *pending_target);
@@ -140,6 +150,9 @@ extern ClusterCtrcApplyResult cluster_undo_record_ctrc_apply_prepared(
 	ClusterCtrcApplyToken *token);
 extern void cluster_undo_record_cancel_prepared(
 	ClusterUndoRecordPrepareReceipt *receipt);
+extern ClusterUndoRecordConsumePreflightResult
+cluster_undo_record_consume_preflight(
+	ClusterUndoRecordPrepareReceipt *receipt, uint16 payload_len);
 extern ClusterUndoRecordConsumeResult cluster_undo_record_consume_prepared(
 	ClusterUndoRecordPrepareReceipt *receipt,
 	const ClusterUndoRecordTarget *target, const void *payload,

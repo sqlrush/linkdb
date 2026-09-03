@@ -38,6 +38,7 @@
 #include <unistd.h>
 
 #include "access/xlog.h"
+#include "cluster/cluster_conf.h"
 #include "cluster/cluster_guc.h"	  /* cluster_undo_gcs_coherence */
 #include "cluster/cluster_mode.h"	  /* cluster_peer_mode_enabled */
 #include "common/file_perm.h"		  /* pg_mkdir_p / pg_dir_create_mode (shared subdir, D2-2) */
@@ -739,7 +740,8 @@ cluster_undo_segment_try_mark_recyclable(uint32 segment_id,
 
 	if (segment_id == 0 || owner_instance < 1
 		|| owner_instance > UNDO_OWNER_INSTANCE_MAX
-		|| !SCN_VALID(horizon) || expected_epoch == 0)
+		|| !SCN_VALID(horizon)
+		|| (expected_epoch == 0 && cluster_conf_node_count() != 4))
 		return CLUSTER_SEG_RECYCLE_READ_FAIL;
 	key.owner_instance = owner_instance;
 	key.segment_id = segment_id;

@@ -126,6 +126,23 @@ cluster_tt_durable_redo_abort_slot_exact(uint8 instance pg_attribute_unused(),
 		sizeof(apply_slot.first_undo_block));
 }
 
+ClusterUndoTtCtrcReleaseRedoDecision
+cluster_tt_durable_ctrc_release_preflight_exact(
+	const xl_undo_tt_slot_ctrc_release_v1 *record)
+{
+	return cluster_undo_tt_ctrc_release_redo_decide(
+		apply_generation, &apply_slot, record);
+}
+
+void
+cluster_tt_durable_redo_ctrc_release_slot_exact(
+	const xl_undo_tt_slot_ctrc_release_v1 *record)
+{
+	if (cluster_tt_durable_ctrc_release_preflight_exact(record)
+		== CLUSTER_UNDO_TT_CTRC_RELEASE_REDO_APPLY)
+		apply_slot.flags = TT_SLOT_FLAG_CTRC_RELEASE_PROVEN;
+}
+
 void
 cluster_tt_durable_redo_abort_slot(uint8 instance pg_attribute_unused(),
 	uint32 segment_id pg_attribute_unused(), uint16 slot_offset pg_attribute_unused(),
@@ -625,10 +642,53 @@ UT_TEST(test_typed_exact_abort_requires_same_active_predecessor)
 		CLUSTER_UNDO_TARGET_BLOCKED);
 }
 
+UT_TEST(test_typed_ctrc_release_requires_exact_terminal_generation_and_post_read)
+{
+	ClusterUndoDecoded operation;
+
+	memset(&operation, 0, sizeof(operation));
+	operation.kind = CLUSTER_UNDO_KIND_TT_CTRC_RELEASE;
+	operation.opcode = XLOG_UNDO_TT_SLOT_CTRC_RELEASE;
+	operation.instance = 3;
+	operation.segment_id = 513;
+	operation.expected_generation = 9;
+	operation.slot_offset = 4;
+	operation.wrap = 7;
+	operation.xid = 801;
+	operation.cluster_epoch = 11;
+	operation.root_id = 12;
+	operation.root_generation = 13;
+	operation.formation_epoch = 14;
+	operation.admission_record_generation = 15;
+	operation.seal_generation = 16;
+	operation.touched_nodes_low = UINT64_C(0x4);
+	operation.terminal_status = TT_SLOT_COMMITTED;
+	operation.format_version = CLUSTER_UNDO_TT_CTRC_RELEASE_VERSION;
+	operation.flags = CLUSTER_UNDO_TT_CTRC_RELEASE_ALL_TOUCHED_ACKED;
+	memset(operation.ack_set_digest, 0x5a,
+		sizeof(operation.ack_set_digest));
+	apply_generation = operation.expected_generation;
+	memset(&apply_slot, 0, sizeof(apply_slot));
+	apply_slot.status = TT_SLOT_COMMITTED;
+	apply_slot.xid = operation.xid;
+	apply_slot.wrap = operation.wrap;
+	apply_slot.commit_scn = 901;
+	apply_read_calls = 0;
+	apply_fail_on_read = 0;
+
+	UT_ASSERT_EQ(cluster_undo_preflight_tt_target_v1(&operation),
+		CLUSTER_UNDO_TARGET_APPLY);
+	UT_ASSERT_EQ(cluster_undo_apply_tt_v1(&operation),
+		CLUSTER_UNDO_APPLY_OK);
+	UT_ASSERT_EQ(apply_slot.flags, TT_SLOT_FLAG_CTRC_RELEASE_PROVEN);
+	UT_ASSERT_EQ(cluster_undo_preflight_tt_target_v1(&operation),
+		CLUSTER_UNDO_TARGET_PROVED_NOOP);
+}
+
 int
 main(void)
 {
-	UT_PLAN(9);
+	UT_PLAN(10);
 
 	UT_RUN(test_decode_tt_commit_fields);
 	UT_RUN(test_decode_tt_bind_exact_shape_and_reserved_bytes);
@@ -639,6 +699,7 @@ main(void)
 	UT_RUN(test_typed_tt_apply_requires_exact_post_read);
 	UT_RUN(test_typed_tt_bind_applies_only_exact_generation_and_predecessor);
 	UT_RUN(test_typed_exact_abort_requires_same_active_predecessor);
+	UT_RUN(test_typed_ctrc_release_requires_exact_terminal_generation_and_post_read);
 
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

@@ -853,6 +853,7 @@ test_cluster_page_producer: test_cluster_page_producer.c unit_test.h \
 
 CLUSTER_PAGE_ANCHOR_CACHE_O = \
 		$(top_builddir)/src/backend/cluster/cluster_page_anchor_cache.o
+CLUSTER_PAGE_STABLE_BASE_O = cluster_page_stable_base_test.o
 
 $(CLUSTER_PAGE_ANCHOR_CACHE_O): \
 		$(top_srcdir)/src/backend/cluster/cluster_page_anchor_cache.c \
@@ -867,9 +868,6 @@ test_cluster_page_anchor_cache: test_cluster_page_anchor_cache.c unit_test.h \
 		xlogreader_fs.o $(top_builddir)/src/common/libpgcommon.a \
 		$(top_builddir)/src/port/libpgport_srv.a $(LDFLAGS) \
 		-lssl -lcrypto -llz4 -lzstd -o $@
-
-CLUSTER_PAGE_STABLE_BASE_O = cluster_page_stable_base_test.o
-
 $(CLUSTER_PAGE_STABLE_BASE_O): \
 		$(top_srcdir)/src/backend/cluster/cluster_page_stable_base.c \
 		$(top_srcdir)/src/include/cluster/cluster_page_stable_base.h
@@ -1912,7 +1910,8 @@ test_cluster_shared_fs: test_cluster_shared_fs.c unit_test.h \
 test_cluster_shared_fs_sharedfs: test_cluster_shared_fs_sharedfs.c unit_test.h \
 		$(CLUSTER_VERSION_O) $(CLUSTER_SHARED_FS_SHAREDFS_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
-		$(CLUSTER_VERSION_O) $(CLUSTER_SHARED_FS_SHAREDFS_O) -o $@
+		$(CLUSTER_VERSION_O) $(CLUSTER_SHARED_FS_SHAREDFS_O) \
+		$(top_builddir)/src/port/libpgport_srv.a -o $@
 
 # spec-6.0a: runtime unit for the raw block_device backend over a
 # temporary regular file that stands in for a block device.  Links only
@@ -2669,6 +2668,7 @@ test_cluster_gcs_block: test_cluster_gcs_block.c unit_test.h $(CLUSTER_VERSION_O
 		$(CLUSTER_RESOURCE_X_RETRY_O)
 	$(CC) $(CFLAGS) $(PTHREAD_CFLAGS) $(CPPFLAGS) \
 		-DGCS_BLOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_gcs_block.c"' \
+		-DPCM_LOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_pcm_lock.c"' \
 		-DRUNTIME_VISIBILITY_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_runtime_visibility.c"' \
 		-DBUFMGR_SOURCE_PATH='"$(top_srcdir)/src/backend/storage/buffer/bufmgr.c"' \
 		-DLMS_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_lms.c"' \
@@ -3298,7 +3298,7 @@ test_cluster_undo_record: test_cluster_undo_record.c unit_test.h \
 		-DHEAPAM_SOURCE_PATH='"$(abspath $(top_srcdir))/src/backend/access/heap/heapam.c"' \
 		-DUNDO_XLOG_HEADER_PATH='"$(abspath $(top_srcdir))/src/include/cluster/storage/cluster_undo_xlog.h"' \
 		-DUNDO_XLOG_SOURCE_PATH='"$(abspath $(top_srcdir))/src/backend/cluster/storage/cluster_undo_xlog.c"' \
-		-DUNDO_FORMAT_HEADER_PATH='"$(abspath $(top_srcdir))/src/include/cluster/cluster_undo_format.h"' \
+		-DTT_SLOT_HEADER_PATH='"$(abspath $(top_srcdir))/src/include/cluster/cluster_tt_slot.h"' \
 		$< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_UNDO_RECORD_TEST_O) $(CLUSTER_UNDO_ALLOC_TEST_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
@@ -3310,6 +3310,11 @@ test_cluster_undo_record: test_cluster_undo_record.c unit_test.h \
 # code.  The source manifest is a test input, not a status authority.
 CLUSTER_CTRC_TEST_O = test_cluster_terminal_ref_census_product.o
 
+.PHONY: check_ctrc_source_census
+check_ctrc_source_census:
+	python3 $(top_srcdir)/src/test/cluster_unit/generate_ctrc_source_census.py \
+		--check $(top_srcdir)/src/test/cluster_unit/ctrc_source_census.tsv
+
 $(CLUSTER_CTRC_TEST_O): \
 		$(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c \
 		$(top_srcdir)/src/include/cluster/cluster_terminal_ref_census.h
@@ -3319,7 +3324,8 @@ $(CLUSTER_CTRC_TEST_O): \
 
 test_cluster_terminal_ref_census: test_cluster_terminal_ref_census.c \
 		ctrc_source_census.tsv heap_reference_producer_census.tsv \
-		current_mx_cardinality_census.tsv unit_test.h $(CLUSTER_CTRC_TEST_O)
+		current_mx_cardinality_census.tsv unit_test.h $(CLUSTER_CTRC_TEST_O) \
+		check_ctrc_source_census
 	$(CC) $(CFLAGS) $(CPPFLAGS) \
 		-DCTRC_SOURCE_MANIFEST_PATH='"$(abspath $(top_srcdir))/src/test/cluster_unit/ctrc_source_census.tsv"' \
 		-DHEAP_REFERENCE_PRODUCER_MANIFEST_PATH='"$(abspath $(top_srcdir))/src/test/cluster_unit/heap_reference_producer_census.tsv"' \

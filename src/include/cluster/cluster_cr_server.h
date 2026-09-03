@@ -571,7 +571,7 @@ extern ClusterMxResolveResult cluster_gcs_current_mx_member_proof_fetch_and_wait
 	int32 origin_node, struct ClusterCurrentMxProofForwardV2 *request,
 	ClusterCurrentMemberProof *proofs, uint16 proofs_cap, uint16 *proof_count,
 	ClusterCurrentUpdaterProof *updater_proof,
-	uint32 *requester_capability_generation_out);
+	uint32 *requester_capability_generation_out, TimestampTz deadline);
 #ifdef USE_CLUSTER_UNIT
 extern ClusterMxResolveResult
 cluster_cr_server_test_current_mx_build_proof_page(

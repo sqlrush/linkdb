@@ -54,6 +54,7 @@
 #include "access/transam.h" /* spec-5.8 D1c — InvalidTransactionId for the GetTopTransactionIdIfAny stub */
 #include "cluster/cluster_cf_enqueue.h"
 #include "cluster/cluster_ges.h"
+#include "cluster/cluster_ges_dedup.h"
 #include "cluster/cluster_ges_reply_wait.h"
 #include "cluster/cluster_touched_peers.h" /* spec-5.14 D2 stamp stub */
 #include "cluster/cluster_grd.h"
@@ -493,6 +494,10 @@ static uint64 stub_backend_request_ready_after = 0;
 static uint64 stub_cancel_wait_enqueue_count = 0;
 static uint32 stub_cancel_wait_last_dest = 0;
 static GesCancelWaitPayload stub_cancel_wait_last;
+static uint64 stub_dedup_lookup_count = 0;
+static uint64 stub_dedup_record_count = 0;
+static uint64 stub_dedup_remove_completed_count = 0;
+static ClusterGesDedupKey stub_dedup_remove_completed_keys[8];
 
 void
 cluster_grd_inc_ges_work_queue_full(void)
@@ -763,22 +768,35 @@ void
 cluster_lms_inc_priority_starvation_observed(void)
 {}
 
-int /* ClusterGesDedupLookupStatus */
-cluster_ges_dedup_lookup_or_register(const void *key pg_attribute_unused(),
+ClusterGesDedupLookupStatus
+cluster_ges_dedup_lookup_or_register(const ClusterGesDedupKey *key pg_attribute_unused(),
 									 uint8 *reply_out pg_attribute_unused(),
 									 uint16 reply_buf_len pg_attribute_unused(),
 									 uint16 *reply_len_out pg_attribute_unused())
 {
+	stub_dedup_lookup_count++;
 	if (reply_len_out)
 		*reply_len_out = 0;
-	return 0; /* CLUSTER_GES_DEDUP_MISS_REGISTERED */
+	return CLUSTER_GES_DEDUP_MISS_REGISTERED;
 }
 
 void
-cluster_ges_dedup_record_reply(const void *key pg_attribute_unused(),
-							   const uint8 *reply pg_attribute_unused(),
-							   uint16 reply_len pg_attribute_unused())
-{}
+cluster_ges_dedup_record_reply(const ClusterGesDedupKey *key pg_attribute_unused(),
+								   const uint8 *reply pg_attribute_unused(),
+								   uint16 reply_len pg_attribute_unused())
+{
+	stub_dedup_record_count++;
+}
+
+bool
+cluster_ges_dedup_remove_completed(const ClusterGesDedupKey *key)
+{
+	if (stub_dedup_remove_completed_count
+		< lengthof(stub_dedup_remove_completed_keys))
+		stub_dedup_remove_completed_keys[stub_dedup_remove_completed_count] = *key;
+	stub_dedup_remove_completed_count++;
+	return true;
+}
 
 bool
 cluster_lms_native_probe_required(const struct ClusterResId *resid pg_attribute_unused(),
@@ -1265,6 +1283,72 @@ init_valid_ges_request(ClusterICEnvelope *env, GesRequestPayload *req,
 	req->holder_node_id = 1;
 	if (resid != NULL)
 		memcpy(req->resid, resid, sizeof(*resid));
+}
+
+/*
+ * A RELEASE is the holder-lifecycle completion message, not another durable
+ * retry receipt.  The exact-holder GRD primitive makes duplicate RELEASE
+ * processing idempotent; retaining one dedup row for every completed release
+ * would otherwise make the fixed HTAB grow monotonically.  The release must
+ * therefore bypass receiver dedup and retire the completed acquisition-family
+ * receipts after the exact release decision.
+ */
+UT_TEST(test_ges_release_bypasses_dedup_and_reclaims_acquire_receipts)
+{
+	ClusterICEnvelope env;
+	GesRequestPayload req;
+	ClusterResId resid;
+	uint64 lookup_before = stub_dedup_lookup_count;
+	uint64 record_before = stub_dedup_record_count;
+	uint64 remove_before = stub_dedup_remove_completed_count;
+	uint64 enqueue_before = stub_work_queue_enqueue_count;
+	uint64 reply_before = stub_lmon_reply_enqueue_count;
+	static const uint32 expected_opcodes[] = {
+		GES_REQ_OPCODE_REQUEST,
+		GES_REQ_OPCODE_REQUEST_NOWAIT,
+		GES_REQ_OPCODE_CONVERT,
+		GES_REQ_OPCODE_REDECLARE,
+	};
+
+	memset(&resid, 0, sizeof(resid));
+	resid.field1 = 77;
+	resid.type = CLUSTER_IR_RESID_TYPE;
+	resid.lockmethodid = DEFAULT_LOCKMETHOD;
+	init_valid_ges_request(&env, &req, GES_REQ_OPCODE_RELEASE, &resid,
+						   ExclusiveLock);
+	req.holder_procno = 23;
+	req.holder_request_id_lo = UINT32_C(0x55667788);
+	req.holder_request_id_hi = UINT32_C(0x11223344);
+	req.shard_master_generation_lo = 19;
+
+	cluster_ges_request_handler(&env, &req);
+	UT_ASSERT_EQ(stub_dedup_lookup_count, lookup_before);
+	UT_ASSERT_EQ(stub_work_queue_enqueue_count, enqueue_before + 1);
+
+	memset(&stub_work_queue_dequeue_item, 0,
+		   sizeof(stub_work_queue_dequeue_item));
+	stub_work_queue_dequeue_item.source_node_id = env.source_node_id;
+	stub_work_queue_dequeue_item.payload_len = sizeof(req);
+	memcpy(stub_work_queue_dequeue_item.payload, &req, sizeof(req));
+	stub_work_queue_dequeue_pending = true;
+	stub_release_and_drain_result = 0;
+
+	UT_ASSERT_EQ(cluster_ges_lmon_drain_work_queue(), 1);
+	UT_ASSERT_EQ(stub_dedup_record_count, record_before);
+	UT_ASSERT_EQ(stub_lmon_reply_enqueue_count, reply_before + 1);
+	UT_ASSERT_EQ(stub_dedup_remove_completed_count,
+				 remove_before + lengthof(expected_opcodes));
+	for (int i = 0; i < lengthof(expected_opcodes); i++) {
+		const ClusterGesDedupKey *key
+			= &stub_dedup_remove_completed_keys[remove_before + i];
+
+		UT_ASSERT_EQ(key->origin_node_id, env.source_node_id);
+		UT_ASSERT_EQ(key->opcode, expected_opcodes[i]);
+		UT_ASSERT_EQ(key->request_id, UINT64_C(0x1122334455667788));
+		UT_ASSERT_EQ(key->cluster_epoch, stub_current_epoch);
+		UT_ASSERT_EQ(key->shard_master_generation, (uint64)19);
+		UT_ASSERT_EQ(key->holder_procno, (uint32)23);
+	}
 }
 
 UT_TEST(test_ges_recovery_ingress_exact_allowlist)
@@ -1906,7 +1990,7 @@ UT_TEST(test_ges_local_release_requires_exact_holder_and_stable_master)
 int
 main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 {
-	UT_PLAN(25);
+	UT_PLAN(26);
 
 	UT_RUN(test_ges_request_handler_linkable);
 	UT_RUN(test_ges_reply_handler_linkable);
@@ -1915,6 +1999,7 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	UT_RUN(test_ges_reply_handler_real_behavior);
 	UT_RUN(test_ges_handler_counter_monotonic_n_invocations);
 	UT_RUN(test_ges_request_valid_payload_enqueues_work);
+	UT_RUN(test_ges_release_bypasses_dedup_and_reclaims_acquire_receipts);
 	UT_RUN(test_ges_recovery_ingress_exact_allowlist);
 	UT_RUN(test_ges_recovery_master_rechecks_before_mutation);
 	UT_RUN(test_ges_starting_redeclare_uses_preseal_transport_only);

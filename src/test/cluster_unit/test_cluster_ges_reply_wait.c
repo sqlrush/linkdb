@@ -46,6 +46,14 @@ bool IsUnderPostmaster = false;
 bool cluster_xnode_profile_enabled = false;
 ClusterXnodeProfileShared *ClusterXnodeProfileCtl = NULL;
 int cluster_ges_reply_wait_max_entries = 1024;
+sigjmp_buf *PG_exception_stack = NULL;
+ErrorContextCallback *error_context_stack = NULL;
+
+void
+pg_re_throw(void)
+{
+	abort();
+}
 
 void
 ExceptionalCondition(const char *conditionName pg_attribute_unused(),
@@ -113,6 +121,12 @@ static long fake_max_size;
 static int fake_lock_depth;
 static int fake_lock_acquires;
 static int fake_lock_releases;
+static int fake_cv_prepare_calls;
+static int fake_cv_timed_sleep_calls;
+static int fake_cv_cancel_calls;
+static ConditionVariable *fake_cv_target;
+static long fake_cv_timeout_ms;
+static uint32 fake_cv_wait_event;
 static union {
 	uint64 force_align;
 	char data[4096];
@@ -247,6 +261,35 @@ ConditionVariableBroadcast(ConditionVariable *cv pg_attribute_unused())
 	Assert(fake_lock_depth == 0);
 }
 
+void
+ConditionVariablePrepareToSleep(ConditionVariable *cv)
+{
+	Assert(fake_lock_depth == 1);
+	fake_cv_prepare_calls++;
+	fake_cv_target = cv;
+}
+
+bool
+ConditionVariableTimedSleep(ConditionVariable *cv, long timeout_ms,
+							uint32 wait_event)
+{
+	Assert(fake_lock_depth == 0);
+	Assert(cv == fake_cv_target);
+	fake_cv_timed_sleep_calls++;
+	fake_cv_timeout_ms = timeout_ms;
+	fake_cv_wait_event = wait_event;
+	return true;
+}
+
+bool
+ConditionVariableCancelSleep(void)
+{
+	Assert(fake_lock_depth == 0);
+	fake_cv_cancel_calls++;
+	fake_cv_target = NULL;
+	return true;
+}
+
 
 /* ============================================================
  * Fixtures.
@@ -279,6 +322,12 @@ reset_reply_wait_with_cap(int max_entries)
 	fake_lock_depth = 0;
 	fake_lock_acquires = 0;
 	fake_lock_releases = 0;
+	fake_cv_prepare_calls = 0;
+	fake_cv_timed_sleep_calls = 0;
+	fake_cv_cancel_calls = 0;
+	fake_cv_target = NULL;
+	fake_cv_timeout_ms = 0;
+	fake_cv_wait_event = 0;
 	cluster_ges_reply_wait_max_entries = max_entries;
 	cluster_ges_reply_wait_shmem_init();
 }
@@ -428,16 +477,54 @@ UT_TEST(test_configured_cap_controls_shmem_and_live_admission)
 	UT_ASSERT_NULL(cluster_ges_reply_wait_insert(&keys[2], 9000));
 }
 
+UT_TEST(test_sleep_exact_waits_without_consuming_pending_entry)
+{
+	GesReplyWaitKey key = make_key(41, 1, 3, 7, 401);
+	GesReplyWaitVerdict verdict = { 0xAAAAAAAAU, 0xBBBBBBBBU };
+
+	reset_reply_wait();
+	UT_ASSERT_NOT_NULL(cluster_ges_reply_wait_insert(&key, 9000));
+	UT_ASSERT(cluster_ges_reply_wait_sleep_exact(&key, 1, 0x1234U));
+	UT_ASSERT_EQ(fake_cv_prepare_calls, 1);
+	UT_ASSERT_EQ(fake_cv_timed_sleep_calls, 1);
+	UT_ASSERT_EQ(fake_cv_cancel_calls, 1);
+	UT_ASSERT_EQ(fake_cv_timeout_ms, 1);
+	UT_ASSERT_EQ(fake_cv_wait_event, 0x1234U);
+	UT_ASSERT_EQ(cluster_ges_reply_wait_poll_consume(&key, &verdict),
+				 GES_REPLY_WAIT_POLL_PENDING);
+	UT_ASSERT_EQ(verdict.reply_opcode, 0xAAAAAAAAU);
+	UT_ASSERT_EQ(verdict.reject_reason, 0xBBBBBBBBU);
+	UT_ASSERT_EQ(fake_lock_acquires, fake_lock_releases);
+}
+
+UT_TEST(test_sleep_exact_refuses_missing_and_abandoned_keys)
+{
+	GesReplyWaitKey key = make_key(42, 1, 3, 7, 402);
+	GesReplyWaitKey other = make_key(43, 1, 3, 7, 402);
+
+	reset_reply_wait();
+	UT_ASSERT_NOT_NULL(cluster_ges_reply_wait_insert(&key, 9000));
+	UT_ASSERT(!cluster_ges_reply_wait_sleep_exact(&other, 1, 0x1234U));
+	UT_ASSERT(!cluster_ges_reply_wait_mark_abandoned(&key, 10000));
+	UT_ASSERT(!cluster_ges_reply_wait_sleep_exact(&key, 1, 0x1234U));
+	UT_ASSERT_EQ(fake_cv_prepare_calls, 0);
+	UT_ASSERT_EQ(fake_cv_timed_sleep_calls, 0);
+	UT_ASSERT_EQ(fake_cv_cancel_calls, 0);
+	UT_ASSERT_EQ(fake_lock_acquires, fake_lock_releases);
+}
+
 int
 main(void)
 {
-	UT_PLAN(6);
+	UT_PLAN(8);
 	UT_RUN(test_poll_pending_keeps_exact_entry);
 	UT_RUN(test_poll_delivered_copies_complete_verdict_then_consumes);
 	UT_RUN(test_poll_abandoned_is_explicit_and_preserves_tombstone);
 	UT_RUN(test_poll_missing_is_explicit_without_output_mutation);
 	UT_RUN(test_poll_matches_all_five_key_fields);
 	UT_RUN(test_configured_cap_controls_shmem_and_live_admission);
+	UT_RUN(test_sleep_exact_waits_without_consuming_pending_entry);
+	UT_RUN(test_sleep_exact_refuses_missing_and_abandoned_keys);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

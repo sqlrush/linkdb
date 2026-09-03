@@ -60,6 +60,7 @@
 #include "cluster/cluster_lock_acquire.h"
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_sinval.h"
+#include "cluster/cluster_terminal_ref_census.h"
 #include "miscadmin.h"
 #include "port/atomics.h"
 #include "storage/backendid.h"
@@ -377,11 +378,31 @@ cluster_ko_flush_and_wait_ack(RelFileLocator rloc, char relpersistence)
 	 * multi-node cluster.  A temp relation is private (no peer caches it); a
 	 * single node / recovery / disabled flush has no remote buffers to drop.
 	 */
-	if (!cluster_object_reuse_flush_enabled)
+	if (!cluster_enabled)
 		return;
 	if (relpersistence == RELPERSISTENCE_TEMP)
 		return;
 	if (cluster_node_id < 0 || RecoveryInProgress())
+		return;
+	/*
+	 * MXA-K14 / §12.8: the AccessExclusiveLock held by the DDL caller
+	 * prevents a new reference publication while this bounded journal census
+	 * runs.  Refuse before KO, buffer invalidation or physical removal unless
+	 * every local receipt for the relfilenode is already terminal.
+	 */
+	if (!cluster_ctrc_relation_removal_ready_shared(
+			(uint32)rloc.spcOid, (uint32)rloc.dbOid,
+			(uint32)rloc.relNumber))
+	{
+		KO_BUMP(failclosed_count);
+		ereport(ERROR,
+				(errcode(ERRCODE_CLUSTER_OBJECT_FLUSH_UNAVAILABLE),
+				 errmsg("could not drain terminal-reference receipts for relfilenode %u/%u/%u before reuse",
+						(unsigned)rloc.spcOid, (unsigned)rloc.dbOid,
+						(unsigned)rloc.relNumber),
+				 errhint("Wait for canonical terminal-reference cleanout and retry.")));
+	}
+	if (!cluster_object_reuse_flush_enabled)
 		return;
 	/*
 	 * Engage from runtime liveness, not the static configured node count
@@ -578,6 +599,17 @@ cluster_ko_drain_inbound_and_apply(void)
 		rloc.spcOid = (Oid)slot.spc_oid;
 		rloc.dbOid = (Oid)slot.db_oid;
 		rloc.relNumber = (RelFileNumber)slot.rel_number;
+		/* A peer may publish DONE only after its own bounded CTRC journal is
+		 * drained.  No ACK makes the enqueuer fail closed without extending
+		 * the existing KO wire. */
+		if (!cluster_ctrc_relation_removal_ready_shared(
+				(uint32)rloc.spcOid, (uint32)rloc.dbOid,
+				(uint32)rloc.relNumber))
+		{
+			head = pg_atomic_read_u32(&ko_state->inbound_head);
+			tail = pg_atomic_read_u32(&ko_state->inbound_tail);
+			continue;
+		}
 		smgr = smgropen(rloc, InvalidBackendId);
 
 		/*

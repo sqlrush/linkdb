@@ -6,9 +6,11 @@
  *	  spec-2.27 reliability hardening introduces retransmit for GES
  *	  REQUEST / RELEASE messages (cluster_ges.c send helpers gain
  *	  exponential backoff loops).  Retransmit safety requires deduplication
- *	  at the receiver:  re-processing a REQUEST twice would double-grant
- *	  the holder count;  re-processing a RELEASE twice would double-pop
- *	  the wait queue.
+ *	  at the receiver:  re-processing an acquisition request twice would
+ *	  double-grant the holder count.  RELEASE is deliberately different:
+ *	  the GRD exact-holder primitive performs no drain when the full holder
+ *	  identity is absent, so RELEASE itself is replay-idempotent and is the
+ *	  lifecycle completion event that retires acquisition receipts.
  *
  *	  Design (HC51 / HC52):
  *	    - LMS-owned shmem region 'pgrac cluster ges dedup' (entries
@@ -140,6 +142,13 @@ cluster_ges_dedup_lookup_or_register(const ClusterGesDedupKey *key, uint8 *reply
  */
 extern void cluster_ges_dedup_record_reply(const ClusterGesDedupKey *key, const uint8 *reply,
 										   uint16 reply_len);
+
+/*
+ * Remove one completed cached reply after a later, causally ordered lifecycle
+ * message proves that the requester can no longer retransmit it.  An in-flight
+ * entry is never removed.  Returns true only when an entry was removed.
+ */
+extern bool cluster_ges_dedup_remove_completed(const ClusterGesDedupKey *key);
 
 /*
  * Sweep entries whose shard_master_generation < current LMS generation.

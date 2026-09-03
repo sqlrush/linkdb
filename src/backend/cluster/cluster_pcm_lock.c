@@ -9737,6 +9737,52 @@ cluster_pcm_lock_resource_x_s_barrier_active_exact(const BufferTag *tag)
 	return active;
 }
 
+bool
+cluster_pcm_lock_resource_x_requester_s_barrier_active_exact(
+	const BufferTag *tag)
+{
+	ClusterPcmResourceXBootstrapRound *round;
+	PcmEntryRef entry_ref;
+	PcmEntryAcquireResult acquire_result;
+	struct GrdEntry *entry;
+	bool active;
+
+	if (tag == NULL || ClusterPcm == NULL)
+		return false;
+	if (!pcm_entry_ref_acquire(tag, false, &entry_ref, &acquire_result))
+		return false;
+	entry = entry_ref.entry;
+
+	LWLockAcquire(&entry->entry_lock.lock, LW_SHARED);
+	round = &entry->resource_x_bootstrap_round;
+	switch (round->phase) {
+		case RESOURCE_X_BOOTSTRAP_ROUND_EMPTY:
+		case RESOURCE_X_BOOTSTRAP_ROUND_FAILED_CLOSED:
+			active = false;
+			break;
+		case RESOURCE_X_BOOTSTRAP_ROUND_TERMINAL_X_CACHED:
+			/* A terminal phase opens S admission only when the retained round
+			 * still proves the exact local cached-X cover.  Malformed terminal
+			 * state remains a conservative retry barrier. */
+			active
+				= !pcm_resource_x_bootstrap_round_terminal_cover_exact_locked(
+					entry, round, &round->terminal_ref,
+					round->master_session_incarnation,
+					round->r4_record_generation,
+					round->cached_ownership_generation);
+			break;
+		case RESOURCE_X_BOOTSTRAP_ROUND_REQUEST_DISPATCHED:
+		case RESOURCE_X_BOOTSTRAP_ROUND_BASE_BOUND:
+		case RESOURCE_X_BOOTSTRAP_ROUND_ASSERT_DISPATCHED:
+		default:
+			active = true;
+			break;
+	}
+	LWLockRelease(&entry->entry_lock.lock);
+	pcm_entry_ref_release(&entry_ref);
+	return active;
+}
+
 static ClusterPcmResourceXMasterRequest *
 pcm_resource_x_start_head_locked(struct GrdEntry *entry,
 								 ClusterPcmResourceXMasterState *state,
@@ -11680,6 +11726,7 @@ pcm_resource_x_bootstrap_round_target_install_inflight_locked(
 	uint32 progress_flags;
 	bool direct_init_generation_exact;
 	bool direct_init_round;
+	bool executor_retry_state_exact;
 	bool identity_exact;
 	bool n_installing;
 	bool phase_exact;
@@ -11771,6 +11818,18 @@ pcm_resource_x_bootstrap_round_target_install_inflight_locked(
 			&& progress_flags
 				== (RESOURCE_X_PROGRESS_BOUND | RESOURCE_X_PROGRESS_T1
 					| RESOURCE_X_PROGRESS_T2));
+	/* dispatch_phase counts scheduled re-drive attempts; it is neither
+	 * authority nor ownership-loss evidence.  An exact BUFFER_BUSY
+	 * observation is likewise the executor's BLOCKED state.  Keep the local
+	 * foreground follower parked across both shapes so the existing retained
+	 * transport tick can rearm and make one more conditional buffer attempt. */
+	executor_retry_state_exact
+		= (entry->resource_x_no_progress_generation == 0
+			&& entry->resource_x_no_progress_reason
+				== RESOURCE_X_NO_PROGRESS_NONE)
+		  || (entry->resource_x_no_progress_generation == attempt
+			  && entry->resource_x_no_progress_reason
+				 == RESOURCE_X_NO_PROGRESS_BUFFER_BUSY);
 	ref_class = pcm_resource_x_ref_classify_locked(entry, &ref);
 	return round->phase == RESOURCE_X_BOOTSTRAP_ROUND_ASSERT_DISPATCHED
 		&& identity_exact
@@ -11784,10 +11843,7 @@ pcm_resource_x_bootstrap_round_target_install_inflight_locked(
 			|| (direct_init_generation_exact && x_activation_cleared
 				&& ref_class == PCM_RX_REF_RETIRED_EXACT))
 		&& phase_exact
-		&& entry->resource_x_no_progress_generation == 0
-		&& entry->resource_x_no_progress_reason
-			== RESOURCE_X_NO_PROGRESS_NONE
-		&& entry->resource_x_dispatch_phase == 0;
+		&& executor_retry_state_exact;
 }
 
 /* BufferDesc and the requester ledger are separate lock domains.  The R9
@@ -13860,6 +13916,28 @@ typedef enum PcmResourceXBootstrapDispatchState {
 	PCM_RESOURCE_X_BOOTSTRAP_DISPATCH_AVAILABLE
 } PcmResourceXBootstrapDispatchState;
 
+#define PCM_RESOURCE_X_DISPATCH_DIAGNOSTIC_INTERVAL_US UINT64_C(250000)
+
+/* The ordinary occupied state is retry guidance, not authority.  It is
+ * common while a same-resource predecessor settles, so recording it for
+ * every candidate scan can starve the master worker.  Corrupt receipts are
+ * still logged unconditionally below. */
+static uint64 pcm_resource_x_dispatch_diagnostic_next_log_at = 0;
+
+static bool
+pcm_resource_x_dispatch_diagnostic_should_log(void)
+{
+	uint64 now_us = pcm_resource_x_monotonic_us();
+
+	if (now_us < pcm_resource_x_dispatch_diagnostic_next_log_at)
+		return false;
+	pcm_resource_x_dispatch_diagnostic_next_log_at
+		= now_us > UINT64_MAX - PCM_RESOURCE_X_DISPATCH_DIAGNOSTIC_INTERVAL_US
+		? UINT64_MAX
+		: now_us + PCM_RESOURCE_X_DISPATCH_DIAGNOSTIC_INTERVAL_US;
+	return true;
+}
+
 /* A bootstrap ACK freezes the exact current authority base before ASSERT.
  * Until that receipt is either replaced by the same requester or consumed
  * and retired with its canonical request, issuing another requester an ACK
@@ -13940,7 +14018,8 @@ pcm_resource_x_bootstrap_dispatch_state_locked(
 			&& (candidate_node != requester_node
 				|| receipt->state
 					!= RESOURCE_X_BOOTSTRAP_RECEIPT_RECEIVED)) {
-			ereport(LOG,
+			if (pcm_resource_x_dispatch_diagnostic_should_log())
+				ereport(LOG,
 					(errmsg_internal("Resource-X kind-9 dispatch blocker diagnostic"),
 					 errdetail("requester=%d candidate=%d invalid_receipt=false "
 							   "receipt_state=%u request_phase=%u",
@@ -13951,7 +14030,8 @@ pcm_resource_x_bootstrap_dispatch_state_locked(
 		}
 		if (request->phase != RESOURCE_X_MASTER_NONE
 			|| memcmp(request, &empty_request, sizeof(*request)) != 0) {
-			ereport(LOG,
+			if (pcm_resource_x_dispatch_diagnostic_should_log())
+				ereport(LOG,
 					(errmsg_internal("Resource-X kind-9 dispatch blocker diagnostic"),
 					 errdetail("requester=%d candidate=%d invalid_receipt=false "
 							   "receipt_state=%u request_phase=%u",

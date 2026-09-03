@@ -62,6 +62,12 @@ sigjmp_buf *PG_exception_stack = NULL;
 ErrorContextCallback *error_context_stack = NULL;
 volatile sig_atomic_t InterruptPending = false;
 
+int
+cluster_conf_node_count(void)
+{
+	return test_cluster_conf.node_count;
+}
+
 static TimestampTz fake_now;
 static uint64 fake_epoch;
 static int32 fake_master;
@@ -127,6 +133,7 @@ static int insert_event;
 static int outbound_event;
 static int reply_delete_calls;
 static int reply_poll_calls;
+static int reply_sleep_calls;
 static int reservation_cancel_calls;
 static int waiter_cancel_calls;
 static int local_release_calls;
@@ -177,6 +184,9 @@ static GesRequestPayload last_outbound;
 static GesRequestPayload last_cleanup_release;
 static GesReplyWaitKey last_insert_key;
 static GesReplyWaitKey last_poll_key;
+static GesReplyWaitKey last_sleep_key;
+static long last_sleep_timeout_ms;
+static uint32 last_sleep_wait_event;
 static ClusterGrdHolderId last_cancel_holder;
 static ClusterResId last_cancel_resid;
 static uint64 last_cancel_wait_seq;
@@ -527,6 +537,17 @@ cluster_ges_reply_wait_poll_consume(const GesReplyWaitKey *key, GesReplyWaitVerd
 }
 
 bool
+cluster_ges_reply_wait_sleep_exact(const GesReplyWaitKey *key, long timeout_ms,
+								   uint32 wait_event)
+{
+	reply_sleep_calls++;
+	last_sleep_key = *key;
+	last_sleep_timeout_ms = timeout_ms;
+	last_sleep_wait_event = wait_event;
+	return true;
+}
+
+bool
 cluster_ges_reply_wait_mark_abandoned(const GesReplyWaitKey *key pg_attribute_unused(),
 									  TimestampTz tombstone_deadline pg_attribute_unused())
 {
@@ -822,7 +843,7 @@ cluster_undo_emit_segment_recycle(uint8 instance pg_attribute_unused(),
 
 bool
 cluster_undo_segment_recyclable_for_mode(
-	const struct UndoSegmentHeaderData *header, SCN horizon pg_attribute_unused(),
+	const struct UndoSegmentHeaderData *header, SCN horizon,
 	bool peer_mode)
 {
 	int i;
@@ -832,10 +853,38 @@ cluster_undo_segment_recyclable_for_mode(
 	if (!peer_mode)
 		return true;
 	for (i = 0; i < TT_SLOTS_PER_SEGMENT; i++) {
-		if (header->tt_slots[i].status == TT_SLOT_ABORTED)
+		const TTSlot *slot = &header->tt_slots[i];
+
+		if (slot->status == TT_SLOT_COMMITTED) {
+			if (!TransactionIdIsNormal(slot->xid)
+				|| slot->flags != TT_SLOT_FLAG_CTRC_RELEASE_PROVEN
+				|| !SCN_VALID(slot->commit_scn)
+				|| !SCN_VALID(horizon)
+				|| scn_time_cmp(slot->commit_scn, horizon) > 0)
+				return false;
+		} else if (slot->status == TT_SLOT_ABORTED) {
+			if (!TransactionIdIsNormal(slot->xid)
+				|| slot->flags != TT_SLOT_FLAG_CTRC_RELEASE_PROVEN
+				|| slot->commit_scn != InvalidScn)
+				return false;
+		} else if ((slot->status == TT_SLOT_UNUSED
+				|| slot->status == TT_SLOT_RECYCLABLE)
+			   && slot->flags != TT_FLAGS_RESERVED)
+			return false;
+		else if (slot->status != TT_SLOT_UNUSED
+				 && slot->status != TT_SLOT_RECYCLABLE)
 			return false;
 	}
 	return true;
+}
+
+int
+scn_time_cmp(SCN a, SCN b)
+{
+	uint64 la = scn_local(a);
+	uint64 lb = scn_local(b);
+
+	return la < lb ? -1 : la > lb ? 1 : 0;
 }
 
 ClusterUndoBlock0Result
@@ -1009,7 +1058,7 @@ reset_fixture(void)
 	smgr_exit_hook_ensure_calls = 0;
 	event_sequence = reserve_event = insert_event = outbound_event = 0;
 	reserve_calls = 0;
-	reply_delete_calls = reply_poll_calls = 0;
+	reply_delete_calls = reply_poll_calls = reply_sleep_calls = 0;
 	reservation_cancel_calls = waiter_cancel_calls = local_release_calls = 0;
 	mirror_release_calls = cancel_wait_calls = cleanup_release_calls = 0;
 	generic_promote_calls = remote_promote_calls = 0;
@@ -1037,6 +1086,9 @@ reset_fixture(void)
 	memset(&last_cleanup_release, 0, sizeof(last_cleanup_release));
 	memset(&last_insert_key, 0, sizeof(last_insert_key));
 	memset(&last_poll_key, 0, sizeof(last_poll_key));
+	memset(&last_sleep_key, 0, sizeof(last_sleep_key));
+	last_sleep_timeout_ms = 0;
+	last_sleep_wait_event = 0;
 	memset(&last_pin_logical, 0, sizeof(last_pin_logical));
 	memset(&last_pin_root, 0, sizeof(last_pin_root));
 	memset(&last_pin_expected, 0, sizeof(last_pin_expected));
@@ -1098,6 +1150,44 @@ UT_TEST(test_key_guard_and_phase_abi)
 	UT_ASSERT_EQ(resid.field4, key.owner_instance);
 	UT_ASSERT_EQ(resid.type, 0xFB);
 	UT_ASSERT_EQ(resid.lockmethodid, DEFAULT_LOCKMETHOD);
+}
+
+UT_TEST(test_wait_reply_uses_exact_acquire_and_release_keys)
+{
+	ClusterUndoBlock0CurrentGuard guard = { 0 };
+	ClusterUndoBlock0LogicalKey key = test_key(1);
+	ClusterUndoBlock0Result failure = CLUSTER_UNDO_BLOCK0_NOT_FOUND;
+	GesReplyWaitKey acquire_key;
+
+	reset_fixture();
+	UT_ASSERT_EQ(cluster_undo_block0_current_acquire_begin(
+		&key, CLUSTER_UNDO_BLOCK0_SCUR, 1000, &guard, &failure),
+		CLUSTER_UNDO_BLOCK0_CURRENT_PENDING);
+	acquire_key = last_insert_key;
+	UT_ASSERT(cluster_undo_block0_current_wait_reply(&guard));
+	UT_ASSERT_EQ(reply_sleep_calls, 1);
+	UT_ASSERT_EQ(memcmp(&last_sleep_key, &acquire_key, sizeof(acquire_key)), 0);
+	UT_ASSERT_EQ(last_sleep_key.request_opcode, GES_REQ_OPCODE_REQUEST);
+	UT_ASSERT_EQ(last_sleep_timeout_ms, 1);
+	UT_ASSERT_EQ(last_sleep_wait_event, WAIT_EVENT_CLUSTER_GES_REPLY_WAIT);
+
+	fake_poll_result = GES_REPLY_WAIT_POLL_DELIVERED;
+	UT_ASSERT_EQ(cluster_undo_block0_current_acquire_poll(&guard, &failure),
+				 CLUSTER_UNDO_BLOCK0_CURRENT_HELD);
+	UT_ASSERT_EQ(cluster_undo_block0_current_release_begin(&guard, &failure),
+				 CLUSTER_UNDO_BLOCK0_CURRENT_PENDING);
+	UT_ASSERT(cluster_undo_block0_current_wait_reply(&guard));
+	UT_ASSERT_EQ(reply_sleep_calls, 2);
+	UT_ASSERT_EQ(last_sleep_key.request_id, acquire_key.request_id);
+	UT_ASSERT_EQ(last_sleep_key.source_node_id, acquire_key.source_node_id);
+	UT_ASSERT_EQ(last_sleep_key.dest_node_id, acquire_key.dest_node_id);
+	UT_ASSERT_EQ(last_sleep_key.cluster_epoch, acquire_key.cluster_epoch);
+	UT_ASSERT_EQ(last_sleep_key.request_opcode, GES_REQ_OPCODE_RELEASE);
+
+	UT_ASSERT_EQ(cluster_undo_block0_current_release_poll(&guard, &failure),
+				 CLUSTER_UNDO_BLOCK0_CURRENT_RELEASED);
+	UT_ASSERT(!cluster_undo_block0_current_wait_reply(&guard));
+	UT_ASSERT_EQ(reply_sleep_calls, 2);
 }
 
 UT_TEST(test_startup_namespace_check_rejects_every_reserved_or_unfrozen_type)
@@ -1218,6 +1308,36 @@ UT_TEST(test_census_borrows_one_caller_token_without_ordinary_reentry_or_leave)
 	UT_ASSERT(semantic_census_recheck_calls > 0);
 	UT_ASSERT_EQ(semantic_leave_calls, 0);
 	UT_ASSERT(admission.entered);
+	UT_ASSERT_EQ(cluster_undo_block0_current_release_begin(&guard, &failure),
+		CLUSTER_UNDO_BLOCK0_CURRENT_RELEASED);
+	UT_ASSERT_EQ(semantic_leave_calls, 0);
+	UT_ASSERT(admission.entered);
+}
+
+UT_TEST(test_ctrc_release_borrows_census_token_for_local_xcur_only)
+{
+	ClusterUndoBlock0CurrentGuard guard = { 0 };
+	ClusterUndoBlock0LogicalKey key = test_key(1);
+	ClusterUndoBlock0Result failure = CLUSTER_UNDO_BLOCK0_NOT_FOUND;
+	ClusterSemanticAdmissionToken admission = {
+		.feature_bit = CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
+		.record_generation = 41,
+		.formation_epoch = 9,
+		.side = CLUSTER_SEMANTIC_TARGET_SIDE,
+		.entered = true
+	};
+
+	reset_fixture();
+	fake_admission_result = CLUSTER_SEMANTIC_ADMISSION_TARGET_DISABLED;
+	fake_master = cluster_node_id;
+	fake_grant_action = CLUSTER_GRD_GRANT_NOW;
+	UT_ASSERT_EQ(cluster_undo_block0_current_acquire_begin_ctrc_release(
+		&key, 1000, &admission, &guard, &failure),
+		CLUSTER_UNDO_BLOCK0_CURRENT_HELD);
+	UT_ASSERT_EQ(current_guard_data(&guard)->mode, ExclusiveLock);
+	UT_ASSERT_EQ(semantic_enter_calls, 0);
+	UT_ASSERT_EQ(semantic_ordinary_recheck_calls, 0);
+	UT_ASSERT(semantic_census_recheck_calls > 0);
 	UT_ASSERT_EQ(cluster_undo_block0_current_release_begin(&guard, &failure),
 		CLUSTER_UNDO_BLOCK0_CURRENT_RELEASED);
 	UT_ASSERT_EQ(semantic_leave_calls, 0);
@@ -2658,6 +2778,37 @@ UT_TEST(test_live_owner_recycle_converges_exact_committed_disk_successor)
 	UT_ASSERT_EQ(memcmp(fake_pin_page, last_flush_successor, BLCKSZ), 0);
 }
 
+UT_TEST(test_live_owner_recycle_epoch_zero_requires_clean_four_node_formation)
+{
+	ClusterUndoBlock0LogicalKey key = test_key(1);
+	UndoSegmentHeaderData *disk;
+
+	reset_fixture();
+	test_cluster_conf.node_count = 4;
+	fake_epoch = 0;
+	fake_modifier_side = CLUSTER_SEMANTIC_TARGET_SIDE;
+	fake_master = cluster_node_id;
+	fake_grant_action = CLUSTER_GRD_GRANT_NOW;
+	fake_sample_generation = (ClusterUndoBlock0Generation){ true, 7 };
+	init_recyclable_block0(fake_disk_page, key.segment_id,
+		key.owner_instance, 7);
+	disk = (UndoSegmentHeaderData *)fake_disk_page;
+	disk->segment_state = SEGMENT_COMMITTED;
+	memcpy(fake_pin_page, fake_disk_page, BLCKSZ);
+
+	UT_ASSERT_EQ(cluster_undo_block0_current_live_owner_recycle_exact(
+		&key, UINT64_C(100), 0, 1000),
+		CLUSTER_UNDO_BLOCK0_RECYCLE_ADVANCED);
+
+	reset_fixture();
+	test_cluster_conf.node_count = 2;
+	fake_epoch = 0;
+	UT_ASSERT_EQ(cluster_undo_block0_current_live_owner_recycle_exact(
+		&key, UINT64_C(100), 0, 1000),
+		CLUSTER_UNDO_BLOCK0_RECYCLE_FAILED);
+	UT_ASSERT_EQ(semantic_enter_calls, 0);
+}
+
 UT_TEST(test_live_owner_recycle_rejects_tt_drift_before_wal)
 {
 	ClusterUndoBlock0LogicalKey key = test_key(1);
@@ -2682,6 +2833,77 @@ UT_TEST(test_live_owner_recycle_rejects_tt_drift_before_wal)
 		CLUSTER_UNDO_BLOCK0_RECYCLE_FAILED);
 	UT_ASSERT_EQ(recycle_wal_calls, 0);
 	UT_ASSERT_EQ(flush_sync_calls, 0);
+}
+
+UT_TEST(test_live_owner_recycle_requires_release_on_every_committed_slot)
+{
+	ClusterUndoBlock0LogicalKey key = test_key(1);
+	UndoSegmentHeaderData *disk;
+	UndoSegmentHeaderData *resident;
+
+	reset_fixture();
+	fake_modifier_side = CLUSTER_SEMANTIC_TARGET_SIDE;
+	fake_master = cluster_node_id;
+	fake_grant_action = CLUSTER_GRD_GRANT_NOW;
+	fake_sample_generation = (ClusterUndoBlock0Generation){ true, 7 };
+	init_recyclable_block0(fake_disk_page, key.segment_id,
+		key.owner_instance, 7);
+	disk = (UndoSegmentHeaderData *)fake_disk_page;
+	disk->segment_state = SEGMENT_COMMITTED;
+	disk->tt_slots[0].status = TT_SLOT_COMMITTED;
+	disk->tt_slots[0].xid = (TransactionId)700;
+	disk->tt_slots[0].wrap = 3;
+	disk->tt_slots[0].commit_scn = (SCN)100;
+	memcpy(fake_pin_page, fake_disk_page, BLCKSZ);
+
+	UT_ASSERT_EQ(cluster_undo_block0_current_live_owner_recycle_exact(
+		&key, (SCN)100, fake_epoch, 1000),
+		CLUSTER_UNDO_BLOCK0_RECYCLE_RETAINED);
+	UT_ASSERT_EQ(recycle_wal_calls, 0);
+	UT_ASSERT_EQ(flush_sync_calls, 0);
+
+	/* Exact release bit plus the inclusive folded floor opens L11. */
+	disk->tt_slots[0].flags = TT_SLOT_FLAG_CTRC_RELEASE_PROVEN;
+	resident = (UndoSegmentHeaderData *)fake_pin_page;
+	resident->tt_slots[0].flags = TT_SLOT_FLAG_CTRC_RELEASE_PROVEN;
+	UT_ASSERT_EQ(cluster_undo_block0_current_live_owner_recycle_exact(
+		&key, (SCN)100, fake_epoch, 1000),
+		CLUSTER_UNDO_BLOCK0_RECYCLE_ADVANCED);
+	UT_ASSERT_EQ(recycle_wal_calls, 1);
+	UT_ASSERT_EQ(flush_sync_calls, 1);
+}
+
+UT_TEST(test_live_owner_recycle_aborted_needs_release_not_scn_age)
+{
+	ClusterUndoBlock0LogicalKey key = test_key(1);
+	UndoSegmentHeaderData *disk;
+	UndoSegmentHeaderData *resident;
+
+	reset_fixture();
+	fake_modifier_side = CLUSTER_SEMANTIC_TARGET_SIDE;
+	fake_master = cluster_node_id;
+	fake_grant_action = CLUSTER_GRD_GRANT_NOW;
+	fake_sample_generation = (ClusterUndoBlock0Generation){ true, 7 };
+	init_recyclable_block0(fake_disk_page, key.segment_id,
+		key.owner_instance, 7);
+	disk = (UndoSegmentHeaderData *)fake_disk_page;
+	disk->segment_state = SEGMENT_COMMITTED;
+	disk->tt_slots[0].status = TT_SLOT_ABORTED;
+	disk->tt_slots[0].xid = (TransactionId)700;
+	disk->tt_slots[0].wrap = 3;
+	disk->tt_slots[0].commit_scn = InvalidScn;
+	memcpy(fake_pin_page, fake_disk_page, BLCKSZ);
+
+	UT_ASSERT_EQ(cluster_undo_block0_current_live_owner_recycle_exact(
+		&key, (SCN)1, fake_epoch, 1000),
+		CLUSTER_UNDO_BLOCK0_RECYCLE_RETAINED);
+	disk->tt_slots[0].flags = TT_SLOT_FLAG_CTRC_RELEASE_PROVEN;
+	resident = (UndoSegmentHeaderData *)fake_pin_page;
+	resident->tt_slots[0].flags = TT_SLOT_FLAG_CTRC_RELEASE_PROVEN;
+	UT_ASSERT_EQ(cluster_undo_block0_current_live_owner_recycle_exact(
+		&key, (SCN)1, fake_epoch, 1000),
+		CLUSTER_UNDO_BLOCK0_RECYCLE_ADVANCED);
+	UT_ASSERT_EQ(recycle_wal_calls, 1);
 }
 
 UT_TEST(test_live_owner_recycle_rejects_invalid_horizon_before_authority_or_wal)
@@ -2737,14 +2959,16 @@ UT_TEST(test_live_owner_recycle_rejects_fold_epoch_drift_before_authority_or_wal
 int
 main(void)
 {
-	UT_PLAN(62);
+	UT_PLAN(67);
 	UT_RUN(test_key_guard_and_phase_abi);
+	UT_RUN(test_wait_reply_uses_exact_acquire_and_release_keys);
 	UT_RUN(test_startup_namespace_check_rejects_every_reserved_or_unfrozen_type);
 	UT_RUN(test_live_owner_resident_preregisters_persistent_exit_hooks);
 	UT_RUN(test_batch_preflight_and_eight_defensive_ensures_register_once);
 	UT_RUN(test_startup_fenced_xcur_begin_end_owns_exact_private_phase);
 	UT_RUN(test_begin_preregisters_persistent_hooks_before_exact_72_byte_remote_send);
 	UT_RUN(test_census_borrows_one_caller_token_without_ordinary_reentry_or_leave);
+	UT_RUN(test_ctrc_release_borrows_census_token_for_local_xcur_only);
 	UT_RUN(test_live_owner_source_borrows_only_xcur_and_target_cannot_produce);
 	UT_RUN(test_live_owner_target_borrows_exact_target_token_for_same_xcur);
 	UT_RUN(test_live_owner_resident_re_admit_obeys_exact_resource_order);
@@ -2797,7 +3021,10 @@ main(void)
 	UT_RUN(test_live_owner_lifecycle_mutation_rejects_tt_or_reserved_changes);
 	UT_RUN(test_live_owner_lifecycle_mutation_rebases_only_exact_current_tt_bytes);
 	UT_RUN(test_live_owner_recycle_converges_exact_committed_disk_successor);
+	UT_RUN(test_live_owner_recycle_epoch_zero_requires_clean_four_node_formation);
 	UT_RUN(test_live_owner_recycle_rejects_tt_drift_before_wal);
+	UT_RUN(test_live_owner_recycle_requires_release_on_every_committed_slot);
+	UT_RUN(test_live_owner_recycle_aborted_needs_release_not_scn_age);
 	UT_RUN(test_live_owner_recycle_rejects_invalid_horizon_before_authority_or_wal);
 	UT_RUN(test_live_owner_recycle_rejects_fold_epoch_drift_before_authority_or_wal);
 	UT_DONE();

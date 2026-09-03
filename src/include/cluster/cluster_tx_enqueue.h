@@ -88,11 +88,14 @@ extern void cluster_tx_enqueue_cleanup_on_backend_exit_callback(int code, Datum 
 
 /*
  * Current-DML MultiXact uses the same TX wait semantics and WFG integration,
- * but marks its waiter slot so the exact matching SetLatch producer can feed
- * the feature-local wakeup counter.
+ * but active R4 never consults the dormant SOURCE row.  It waits for one
+ * bounded native wake/poll slice, returns RETRY after full cleanup, and lets
+ * the heap caller re-DESCRIBE exact TARGET authority.  The caller retains the
+ * in/out monotonic deadline across those retries; zero initializes it once.
  */
 extern ClusterTxwResult cluster_tx_enqueue_wait_current_mx(
-	const ClusterTTStatusKey *holder_key, int effective_timeout_ms);
+	const ClusterTTStatusKey *holder_key, int effective_timeout_ms,
+	uint64 *absolute_deadline_mono_us);
 
 /*
  * cluster_txw_wake_waiters — wake every backend waiting on holder_key.

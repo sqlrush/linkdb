@@ -52,6 +52,7 @@ typedef enum ClusterUndoDecodedKind
 	CLUSTER_UNDO_KIND_TT_COMMIT,
 	CLUSTER_UNDO_KIND_TT_ABORT,
 	CLUSTER_UNDO_KIND_TT_SET_HEAD,
+	CLUSTER_UNDO_KIND_TT_CTRC_RELEASE,
 	CLUSTER_UNDO_KIND_SEGMENT_RECYCLE,
 	CLUSTER_UNDO_KIND_SEGMENT_REUSE,
 	CLUSTER_UNDO_KIND_BLOCK_WRITE,
@@ -87,11 +88,21 @@ typedef struct ClusterUndoDecoded
 	uint32		payload_length;
 	uint32		expected_generation;
 	uint32		new_generation;
+	uint32		cluster_epoch;
+	uint64		root_id;
+	uint64		root_generation;
+	uint64		formation_epoch;
+	uint64		admission_record_generation;
+	uint64		seal_generation;
+	uint64		touched_nodes_low;
+	uint64		touched_nodes_high;
+	uint8		ack_set_digest[16];
 	uint8		format_version;
 	uint8		flags;
+	uint8		terminal_status;
 	uint8		old_state;
 	uint8		new_state;
-	uint8		reserved_zero[2];
+	uint8		reserved_zero[1];
 	UBA			first_undo_block;
 } ClusterUndoDecoded;
 

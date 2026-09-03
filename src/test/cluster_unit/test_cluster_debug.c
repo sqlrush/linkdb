@@ -44,6 +44,7 @@
 
 #include "cluster/cluster_catalog_stats.h" /* spec-6.14 D10b catalog counter stubs */
 #include "cluster/cluster_debug.h"
+#include "cluster/cluster_terminal_ref_census.h"
 #include "cluster/cluster_grd.h"		  /* ClusterGrdRecoveryCounters */
 #include "cluster/cluster_hang.h"		  /* spec-5.11: ClusterHangDumpData for dump_hang stubs */
 #include "cluster/cluster_hang_resolve.h" /* spec-5.12: ClusterHangResolveCounters for dump stubs */
@@ -425,6 +426,60 @@ uint64
 cluster_multixact_get_mxid_underivable_read_count(void)
 {
 	return 0;
+}
+
+const char *
+cluster_ctrc_stat_name(ClusterCtrcStatId stat)
+{
+	static const char *const names[CTRC_STAT_COUNT] = {
+		[CTRC_STAT_GRANT_ISSUED] = "grant_issued_count",
+		[CTRC_STAT_GRANT_REFUSED] = "grant_refused_count",
+		[CTRC_STAT_RECEIPT_PREPARED] = "receipt_prepared_count",
+		[CTRC_STAT_RECEIPT_APPLIED] = "receipt_applied_count",
+		[CTRC_STAT_RECEIPT_CANCELLED] = "receipt_cancelled_count",
+		[CTRC_STAT_RECEIPT_CAPACITY_REFUSED] = "receipt_capacity_refused_count",
+		[CTRC_STAT_SEAL_STARTED] = "seal_started_count",
+		[CTRC_STAT_SEAL_BLOCKED] = "seal_blocked_count",
+		[CTRC_STAT_TARGET_ABSENT] = "target_absent_count",
+		[CTRC_STAT_TARGET_REWRITTEN] = "target_rewritten_count",
+		[CTRC_STAT_TARGET_RETAINED] = "target_retained_count",
+		[CTRC_STAT_ACK_FROZEN] = "ack_frozen_count",
+		[CTRC_STAT_ACK_RESENT] = "ack_resent_count",
+		[CTRC_STAT_CERTIFICATE_APPLIED] = "certificate_applied_count",
+		[CTRC_STAT_CERTIFICATE_REPLAYED] = "certificate_replayed_count",
+		[CTRC_STAT_L11_RELEASE_SAMPLE] = "l11_release_sample_count",
+		[CTRC_STAT_L12_RECYCLE] = "l12_recycle_count",
+		[CTRC_STAT_ORDINARY_PUBLICATION_AFTER_APPLY] = "ordinary_publication_after_apply_count",
+		[CTRC_STAT_CURRENT_MX_PUBLICATION_AFTER_APPLY] = "current_mx_publication_after_apply_count",
+		[CTRC_STAT_PUBLICATION_ORDER_VIOLATION] = "publication_order_violation_count",
+	};
+
+	return stat >= 0 && stat < CTRC_STAT_COUNT ? names[stat] : NULL;
+}
+
+uint64
+cluster_ctrc_stat_get(ClusterCtrcStatId stat pg_attribute_unused())
+{
+	return 0;
+}
+
+const char *
+cluster_ctrc_cleaner_reason_name(ClusterCtrcCleanerReason reason)
+{
+	return reason == CTRC_CLEANER_REASON_NONE ? "NONE" : "BLOCKED";
+}
+
+ClusterCtrcCleanerReason
+cluster_ctrc_cleaner_reason_get(void)
+{
+	return CTRC_CLEANER_REASON_NONE;
+}
+
+bool
+cluster_ctrc_debug_snapshot(ClusterCtrcDebugSnapshot *snapshot)
+{
+	MemSet(snapshot, 0, sizeof(*snapshot));
+	return true;
 }
 /* spec-6.14 D5 stub: dump_catalog reads the shared relmap authority header;
  * cluster_relmap_authority.o is not linked here.  cluster_shared_catalog is
@@ -3551,8 +3606,28 @@ cluster_membership_is_member(int32 node_id pg_attribute_unused())
 	return false;
 }
 
+ClusterMembershipState
+cluster_membership_get_state(int32 node_id pg_attribute_unused())
+{
+	return CLUSTER_MEMBER_ABSENT;
+}
+
 bool
 cluster_reconfig_self_join_admitted(void)
+{
+	return false;
+}
+
+bool
+cluster_reconfig_epoch0_late_founder_evidence_current(void)
+{
+	return false;
+}
+
+bool
+cluster_reconfig_stage_pre_publish_join_handoff(
+	uint64 expected_self_incarnation pg_attribute_unused(),
+	uint64 expected_predecessor_floor pg_attribute_unused())
 {
 	return false;
 }
@@ -3560,6 +3635,12 @@ cluster_reconfig_self_join_admitted(void)
 void
 cluster_cf_phase2_verify_or_fail(const char *pgdata pg_attribute_unused())
 {
+}
+
+bool
+cluster_cf_phase2_peer_verified(void)
+{
+	return false;
 }
 
 bool
@@ -3872,6 +3953,11 @@ cluster_qvotec_wait_for_ready(int timeout_ms pg_attribute_unused())
 /* spec-2.18 Sprint A stubs: same for LMS. */
 int
 cluster_lms_start(void)
+{
+	return 0;
+}
+pid_t
+cluster_lms_get_pid(void)
 {
 	return 0;
 }
@@ -4791,6 +4877,34 @@ UT_TEST(test_debug_dump_exposes_exact_current_protocol_debt_gauges)
 	UT_ASSERT_STR_EQ(captured_dump_value("pcm", "resource_x_invalid_debt_count"), "19");
 }
 
+UT_TEST(test_debug_dump_exposes_closed_ctrc_observability)
+{
+	LOCAL_FCINFO(fcinfo, 0);
+	ReturnSetInfo rsinfo;
+	int i;
+
+	memset(fcinfo, 0, SizeForFunctionCallInfo(0));
+	memset(&rsinfo, 0, sizeof(rsinfo));
+	memset(captured_dump_categories, 0, sizeof(captured_dump_categories));
+	memset(captured_dump_keys, 0, sizeof(captured_dump_keys));
+	memset(captured_dump_values, 0, sizeof(captured_dump_values));
+	captured_dump_row_count = 0;
+	captured_formatted_value_count = 0;
+	fcinfo->resultinfo = (fmNodePtr)&rsinfo;
+	(void)cluster_dump_state(fcinfo);
+
+	for (i = 0; i < CTRC_STAT_COUNT; i++)
+		UT_ASSERT_EQ(captured_dump_count("ctrc",
+			cluster_ctrc_stat_name((ClusterCtrcStatId)i)), 1);
+	UT_ASSERT_STR_EQ(captured_dump_value("ctrc", "cleaner_reason"), "NONE");
+	UT_ASSERT_EQ(captured_dump_count("ctrc", "test_barrier_phase"), 1);
+	UT_ASSERT_EQ(captured_dump_count("ctrc", "test_barrier_hit_count"), 1);
+	UT_ASSERT_EQ(captured_dump_count("ctrc", "origin_open"), 1);
+	UT_ASSERT_EQ(captured_dump_count("ctrc", "participant_ack_frozen"), 1);
+	UT_ASSERT_EQ(captured_dump_count("ctrc", "receipt_applied"), 1);
+	UT_ASSERT_EQ(captured_dump_count("ctrc", "full_refusal_count"), 1);
+}
+
 /* ============================================================
  * Iterator API on cluster_inject (added in spec-0.29 §1.4).
  * ============================================================ */
@@ -5367,12 +5481,13 @@ UT_TEST(test_debug_phase_symbol_present)
 int
 main(void)
 {
-	UT_PLAN(15);
+	UT_PLAN(16);
 	UT_RUN(test_debug_dump_srf_linkable);
 	UT_RUN(test_debug_dump_omits_retired_legacy_pcm_x_compatibility_keys);
 	UT_RUN(test_debug_dump_exposes_exact_resource_x_owner_state);
 	UT_RUN(test_debug_dump_exposes_native_pcm_grd_lifecycle_stats);
 	UT_RUN(test_debug_dump_exposes_exact_current_protocol_debt_gauges);
+	UT_RUN(test_debug_dump_exposes_closed_ctrc_observability);
 	UT_RUN(test_debug_inject_get_count_callable);
 	UT_RUN(test_debug_inject_get_state_at_out_of_range);
 	UT_RUN(test_debug_inject_get_state_at_null_outs);

@@ -94,6 +94,7 @@ PG_FUNCTION_INFO_V1(cluster_dump_state);
 #include "cluster/cluster_lms.h"	 /* cluster_lms_* observability accessors (spec-2.18 D10) */
 #include "cluster/cluster_tt_slot.h" /* spec-3.12 D5 retention counters */
 #include "cluster/cluster_terminal_authority.h" /* spec-6.2 authority counters */
+#include "cluster/cluster_terminal_ref_census.h" /* spec-8.4D CTRC */
 #include "cluster/cluster_sf_dep.h"				/* spec-6.2 Smart Fusion dep counters */
 #include "cluster/cluster_undo_record_api.h"  /* cluster_undo_* counter accessors (spec-3.7 D10) */
 #include "cluster/storage/cluster_undo_buf.h" /* spec-3.18 D7: undo buffer counters */
@@ -3927,12 +3928,73 @@ dump_multixact_current(ReturnSetInfo *rsinfo)
 		[CMX_STAT_RESTART_BUCKET_8_PLUS] = "restart_bucket_8_plus_count",
 		[CMX_STAT_RESTART_MAX] = "restart_max",
 		[CMX_STAT_FOREIGN_SLRU_GUARD] = "foreign_slru_guard_count",
+		[CMX_STAT_UPDATER_PROVENANCE_CROSS_SEGMENT_MATCH]
+			= "updater_provenance_cross_segment_match_count",
 	};
 	int i;
 
 	for (i = 0; i < CMX_STAT_COUNT; i++)
 		emit_row(rsinfo, "multixact_current", names[i],
 				 fmt_int64((int64)cluster_multixact_current_stats_get(i)));
+}
+
+static void
+dump_ctrc(ReturnSetInfo *rsinfo)
+{
+	ClusterCtrcDebugSnapshot snapshot;
+	ClusterCtrcCleanerReason reason;
+	const char *reason_name;
+	int i;
+
+	for (i = 0; i < CTRC_STAT_COUNT; i++)
+		emit_row(rsinfo, "ctrc",
+			cluster_ctrc_stat_name((ClusterCtrcStatId)i),
+			fmt_int64((int64)cluster_ctrc_stat_get(
+				(ClusterCtrcStatId)i)));
+
+	MemSet(&snapshot, 0, sizeof(snapshot));
+	if (!cluster_ctrc_debug_snapshot(&snapshot))
+		return;
+	reason = cluster_ctrc_cleaner_reason_get();
+	reason_name = cluster_ctrc_cleaner_reason_name(reason);
+	emit_row(rsinfo, "ctrc", "cleaner_reason",
+		reason_name != NULL ? reason_name : "BLOCKED");
+	emit_row(rsinfo, "ctrc", "test_barrier_phase",
+		fmt_int64((int64)snapshot.test_barrier_phase));
+	emit_row(rsinfo, "ctrc", "test_barrier_hit_count",
+		fmt_int64((int64)snapshot.test_barrier_hit_count));
+	emit_row(rsinfo, "ctrc", "origin_open",
+		fmt_int64((int64)snapshot.origin_open));
+	emit_row(rsinfo, "ctrc", "origin_sealing",
+		fmt_int64((int64)snapshot.origin_sealing));
+	emit_row(rsinfo, "ctrc", "origin_release_proven",
+		fmt_int64((int64)snapshot.origin_release_proven));
+	emit_row(rsinfo, "ctrc", "origin_blocked",
+		fmt_int64((int64)snapshot.origin_blocked));
+	emit_row(rsinfo, "ctrc", "participant_open",
+		fmt_int64((int64)snapshot.participant_open));
+	emit_row(rsinfo, "ctrc", "participant_draining",
+		fmt_int64((int64)snapshot.participant_draining));
+	emit_row(rsinfo, "ctrc", "participant_ack_ready",
+		fmt_int64((int64)snapshot.participant_ack_ready));
+	emit_row(rsinfo, "ctrc", "participant_ack_frozen",
+		fmt_int64((int64)snapshot.participant_ack_frozen));
+	emit_row(rsinfo, "ctrc", "participant_blocked",
+		fmt_int64((int64)snapshot.participant_blocked));
+	emit_row(rsinfo, "ctrc", "receipt_prepared",
+		fmt_int64((int64)snapshot.receipt_prepared));
+	emit_row(rsinfo, "ctrc", "receipt_applied",
+		fmt_int64((int64)snapshot.receipt_applied));
+	emit_row(rsinfo, "ctrc", "receipt_cleaned",
+		fmt_int64((int64)snapshot.receipt_cleaned));
+	emit_row(rsinfo, "ctrc", "receipt_cancelled",
+		fmt_int64((int64)snapshot.receipt_cancelled));
+	emit_row(rsinfo, "ctrc", "receipt_ack_frozen",
+		fmt_int64((int64)snapshot.receipt_ack_frozen));
+	emit_row(rsinfo, "ctrc", "receipt_blocked",
+		fmt_int64((int64)snapshot.receipt_blocked));
+	emit_row(rsinfo, "ctrc", "full_refusal_count",
+		fmt_int64((int64)snapshot.full_refusal_count));
 }
 
 #endif /* USE_PGRAC_CLUSTER */
@@ -4004,6 +4066,7 @@ cluster_dump_state(PG_FUNCTION_ARGS)
 		dump_xnode_lever(rsinfo);	/* spec-6.12 */
 		dump_xid_stripe(rsinfo);	/* spec-6.15 D6 */
 		dump_multixact_current(rsinfo);
+		dump_ctrc(rsinfo);
 		dump_catalog(rsinfo);		/* spec-6.14 D10 */
 	}
 #else

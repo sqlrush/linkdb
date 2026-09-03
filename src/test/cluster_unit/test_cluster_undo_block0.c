@@ -211,6 +211,12 @@ LWLockAcquire(LWLock *lock pg_attribute_unused(), LWLockMode mode pg_attribute_u
 	return true;
 }
 
+bool
+LWLockConditionalAcquire(LWLock *lock, LWLockMode mode)
+{
+	return LWLockAcquire(lock, mode);
+}
+
 void
 LWLockRelease(LWLock *lock pg_attribute_unused())
 {

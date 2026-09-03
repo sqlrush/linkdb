@@ -300,10 +300,16 @@ extern void ClusterObserveBufferBarrierReceipt(ClusterBufferBarrierSiteId site_i
 											BlockNumber blocknum,
 											ClusterBufferBarrierOutcome outcome,
 											uint64 proof_mask);
-/* PGRAC: EXCLUSIVE lock that hands a nested-guard BARRIER_CLOSED refusal
- * back to the caller (false, nothing held) instead of raising an ERROR. */
+/* PGRAC: EXCLUSIVE lock that hands a nested-guard BARRIER_CLOSED refusal or
+ * pre-mutation Resource-X drift back to the caller (false, nothing held)
+ * instead of raising an ERROR.  pin_replaced reports that a deliberate
+ * VM/FSM pin handoff let the old numeric BufferDesc be reused. */
 extern bool ClusterLockBufferExclusiveBarrierAware(Buffer buffer,
-											 ClusterBufferBarrierSiteId site_id);
+											 ClusterBufferBarrierSiteId site_id,
+											 bool *pin_replaced);
+/* PGRAC: EXCLUSIVE lock for pass-based auxiliary work.  False is a clean
+ * pre-content-X Resource-X retry; the caller retains only its original pin. */
+extern bool ClusterLockBufferExclusiveRetryAware(Buffer buffer);
 /* PGRAC: SHARE counterpart with the same clean-refusal contract. */
 extern bool ClusterLockBufferShareBarrierAware(Buffer buffer);
 /* PGRAC: operation-scoped PCM-X direct-init entrances for zero VM/FSM pages. */

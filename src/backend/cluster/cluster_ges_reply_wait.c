@@ -420,6 +420,54 @@ cluster_ges_reply_wait_poll_consume(const GesReplyWaitKey *key,
 }
 
 bool
+cluster_ges_reply_wait_sleep_exact(const GesReplyWaitKey *key, long timeout_ms,
+								   uint32 wait_event)
+{
+	GesReplyWaitEntry *entry;
+	bool ready;
+
+	if (key == NULL || timeout_ms <= 0 || reply_wait_state == NULL
+		|| reply_wait_htab == NULL)
+		return false;
+
+	/*
+	 * Prepare under the table lock before testing ready.  Delivery sets ready
+	 * under the exclusive form of the same lock and broadcasts only after
+	 * releasing it, so a reply cannot land between the predicate check and CV
+	 * enrollment without leaving either ready=true or a queued wakeup.
+	 *
+	 * A live entry is removed only by its owning backend's poll/abandon path;
+	 * the tombstone sweep never removes a live waiter.  The pointer therefore
+	 * remains valid until this backend returns to poll_consume().
+	 */
+	LWLockAcquire(&reply_wait_state->lwlock, LW_SHARED);
+	entry = (GesReplyWaitEntry *)hash_search(reply_wait_htab, key, HASH_FIND, NULL);
+	if (entry == NULL || entry->abandoned) {
+		LWLockRelease(&reply_wait_state->lwlock);
+		return false;
+	}
+	ConditionVariablePrepareToSleep(&entry->cv);
+	pg_read_barrier();
+	ready = entry->ready;
+	LWLockRelease(&reply_wait_state->lwlock);
+
+	if (!ready) {
+		PG_TRY();
+		{
+			(void)ConditionVariableTimedSleep(&entry->cv, timeout_ms, wait_event);
+		}
+		PG_CATCH();
+		{
+			ConditionVariableCancelSleep();
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
+	}
+	ConditionVariableCancelSleep();
+	return true;
+}
+
+bool
 cluster_ges_reply_wait_mark_abandoned(const GesReplyWaitKey *key, TimestampTz tombstone_deadline)
 {
 	GesReplyWaitEntry *entry;

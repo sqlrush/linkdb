@@ -244,6 +244,14 @@ extern void cluster_itl_touch_register_exact_ctrc(
 	const ClusterItlTouchHandle *handle, Buffer buffer, TransactionId xid,
 	const ClusterCtrcReceiptHandle *ctrc_handle);
 
+/* Lookup-only accelerator for same-transaction, same-ITL receipt reuse.
+ * The caller holds the page content lock EXCLUSIVE.  A hit requires the
+ * current slot bytes and local X-owner proof to match the newest capture in
+ * the current subtransaction range; a miss changes no shared state. */
+extern bool cluster_itl_touch_lookup_reusable_ctrc(
+	const ClusterItlTouchHandle *handle, Buffer buffer, TransactionId xid,
+	ClusterCtrcReceiptHandle *ctrc_handle_out);
+
 /*
  * spec-3.5 hardening: subxact range ownership for touched ITL slots.
  *

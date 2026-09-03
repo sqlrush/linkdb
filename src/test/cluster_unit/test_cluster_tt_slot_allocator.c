@@ -65,6 +65,7 @@
 #include "access/transam.h"
 #include "cluster/cluster_conf.h" /* ClusterConfShmem (peer-mode test topology) */
 #include "cluster/cluster_scn.h"
+#include "cluster/cluster_terminal_ref_census.h"
 #include "cluster/cluster_tt_slot.h"
 #include "cluster/cluster_undo_cleaner.h" /* gc pass + stats (spec-3.13) */
 #include "storage/spin.h"				  /* slock_t (spec-3.15 map stub) */
@@ -84,12 +85,25 @@ UT_DEFINE_GLOBALS();
 /* spec-5.22e D5-3 stub: the gc pass consults the F-D2 epoch fence
  * (cluster_undo_horizon_ic.c not linked here); never tripped in unit. */
 bool cluster_undo_horizon_epoch_fence_tripped(uint64 expected_epoch);
+bool cluster_ctrc_terminal_release_sample_exact(uint32 segment_id,
+	uint16 slot_offset, TransactionId xid, uint16 slot_wrap,
+	uint8 terminal_status, SCN terminal_scn, uint64 expected_epoch);
+void cluster_undo_cleaner_wakeup(void);
+
 bool
 cluster_undo_horizon_epoch_fence_tripped(uint64 expected_epoch)
 {
 	(void)expected_epoch;
 	return false;
 }
+
+void
+cluster_undo_cleaner_wakeup(void)
+{}
+
+void
+cluster_ctrc_stat_bump(ClusterCtrcStatId stat pg_attribute_unused())
+{}
 
 
 /* ============================================================
@@ -103,6 +117,11 @@ static void *mock_shmem_buffer = NULL;
 static int mock_lwlock_acquire_excl_count = 0;
 static int mock_lwlock_acquire_shared_count = 0;
 static int mock_lwlock_release_count = 0;
+static int mock_lwlock_depth = 0;
+static bool mock_ctrc_release_proven = false;
+static bool mock_ctrc_rebind_during_sample = false;
+static int mock_ctrc_sample_calls = 0;
+static int mock_ctrc_sample_lock_depth = -1;
 
 void *
 ShmemInitStruct(const char *name pg_attribute_unused(), Size size, bool *foundPtr)
@@ -125,6 +144,7 @@ LWLockInitialize(LWLock *lock pg_attribute_unused(), int tranche_id pg_attribute
 bool
 LWLockAcquire(LWLock *lock pg_attribute_unused(), LWLockMode mode)
 {
+	mock_lwlock_depth++;
 	if (mode == LW_EXCLUSIVE)
 		mock_lwlock_acquire_excl_count++;
 	else if (mode == LW_SHARED)
@@ -135,7 +155,55 @@ LWLockAcquire(LWLock *lock pg_attribute_unused(), LWLockMode mode)
 void
 LWLockRelease(LWLock *lock pg_attribute_unused())
 {
+	UT_ASSERT(mock_lwlock_depth > 0);
+	mock_lwlock_depth--;
 	mock_lwlock_release_count++;
+}
+
+/* 8D-12: product code samples the canonical terminal/release bytes outside
+ * the allocator lock.  This test-controlled stand-in also permits an exact
+ * away-and-back rebind while the sample is in flight, exercising the final
+ * allocator-candidate ABA recheck. */
+bool
+cluster_ctrc_terminal_release_sample_exact(uint32 segment_id,
+										   uint16 slot_offset,
+										   TransactionId xid,
+										   uint16 slot_wrap,
+										   uint8 terminal_status,
+										   SCN terminal_scn,
+										   uint64 expected_epoch)
+{
+	mock_ctrc_sample_calls++;
+	mock_ctrc_sample_lock_depth = mock_lwlock_depth;
+	UT_ASSERT_EQ(segment_id, UINT32_C(1));
+	UT_ASSERT_EQ(slot_offset, 0);
+	UT_ASSERT_EQ(xid, (TransactionId)100);
+	UT_ASSERT_EQ(slot_wrap, 0);
+	UT_ASSERT(terminal_status == TT_SLOT_COMMITTED
+			  || terminal_status == TT_SLOT_ABORTED);
+	UT_ASSERT_EQ(expected_epoch, UINT64_C(7));
+	if (terminal_status == TT_SLOT_COMMITTED)
+		UT_ASSERT(SCN_VALID(terminal_scn));
+	else
+		UT_ASSERT_EQ(terminal_scn, InvalidScn);
+
+	if (mock_ctrc_rebind_during_sample)
+	{
+		uint16 rebound;
+
+		mock_ctrc_rebind_during_sample = false;
+		cluster_tt_slot_rollover(0, 2, NULL);
+		cluster_tt_slot_rollover(0, UINT32_C(1), NULL);
+		rebound = cluster_tt_slot_alloc(UINT32_C(1), (TransactionId)100);
+		UT_ASSERT_EQ(rebound, 0);
+		if (terminal_status == TT_SLOT_COMMITTED)
+			cluster_tt_slot_mark_committed(UINT32_C(1), rebound,
+				(TransactionId)100, terminal_scn);
+		else
+			cluster_tt_slot_mark_aborted(UINT32_C(1), rebound,
+				(TransactionId)100);
+	}
+	return mock_ctrc_release_proven;
 }
 
 
@@ -280,6 +348,11 @@ reset_allocator(void)
 	mock_lwlock_acquire_excl_count = 0;
 	mock_lwlock_acquire_shared_count = 0;
 	mock_lwlock_release_count = 0;
+	mock_lwlock_depth = 0;
+	mock_ctrc_release_proven = false;
+	mock_ctrc_rebind_during_sample = false;
+	mock_ctrc_sample_calls = 0;
+	mock_ctrc_sample_lock_depth = -1;
 
 	/* Default: no retention constraint (cluster-disabled sentinel), gate on. */
 	mock_retention_horizon = InvalidScn;
@@ -1093,8 +1166,16 @@ UT_TEST(test_t48_peer_mode_committed_recycle_waits_for_cluster_floor_cleaner)
 	UT_ASSERT_EQ((int)retained, 1);
 	UT_ASSERT_EQ((int)cluster_tt_slot_get_wrap(NODE0_SEG, off), 0);
 
-	/* Once the proven cluster floor passes the commit, cleaner owns recycle. */
+	/* A proven floor alone is insufficient: canonical CTRC release is the
+	 * second half of L11. */
 	memset(&stats, 0, sizeof(stats));
+	cluster_tt_slot_gc_current_pass((SCN)20, (uint64)7, &stats);
+	UT_ASSERT_EQ((int)stats.shmem_tt_slots_gcd, 0);
+	UT_ASSERT_EQ(mock_ctrc_sample_calls, 1);
+	UT_ASSERT_EQ(mock_ctrc_sample_lock_depth, 0);
+
+	/* Once both proofs exist, the cleaner owns the exact recycle. */
+	mock_ctrc_release_proven = true;
 	cluster_tt_slot_gc_current_pass((SCN)20, (uint64)7, &stats);
 	UT_ASSERT_EQ((int)stats.shmem_tt_slots_gcd, 1);
 	result = cluster_tt_slot_alloc(NODE0_SEG, (TransactionId)99999);
@@ -1133,6 +1214,40 @@ UT_TEST(test_t49_peer_mode_aborted_retains_canonical_slot)
 	UT_ASSERT_EQ((int)result, (int)INVALID_TT_SLOT_OFFSET);
 	UT_ASSERT_EQ((int)retained, 1);
 	UT_ASSERT_EQ((int)cluster_tt_slot_get_wrap(NODE0_SEG, off), 0);
+
+	/* L12 has no SCN horizon, but exact durable ABORTED + CTRC release
+	 * makes the same slot recyclable. */
+	mock_ctrc_release_proven = true;
+	cluster_tt_slot_gc_current_pass(InvalidScn, (uint64)7, &stats);
+	UT_ASSERT_EQ((int)stats.shmem_tt_slots_gcd, 1);
+	result = cluster_tt_slot_alloc(NODE0_SEG, (TransactionId)99999);
+	UT_ASSERT_EQ((int)result, (int)off);
+	UT_ASSERT_EQ((int)cluster_tt_slot_get_wrap(NODE0_SEG, off), 1);
+}
+
+UT_TEST(test_t54_peer_gc_rejects_exact_candidate_aba_after_release_sample)
+{
+	ClusterUndoCleanerPassStats stats = {0};
+	ClusterTTSlotCurrentOwner owner;
+	uint16 off;
+
+	reset_allocator();
+	mock_cluster_conf.node_count = 2;
+	off = cluster_tt_slot_alloc(NODE0_SEG, (TransactionId)100);
+	UT_ASSERT_EQ(off, 0);
+	cluster_tt_slot_mark_committed(NODE0_SEG, off,
+		(TransactionId)100, (SCN)10);
+	mock_ctrc_release_proven = true;
+	mock_ctrc_rebind_during_sample = true;
+
+	cluster_tt_slot_gc_current_pass((SCN)20, (uint64)7, &stats);
+	UT_ASSERT_EQ(mock_ctrc_sample_calls, 1);
+	UT_ASSERT_EQ(mock_ctrc_sample_lock_depth, 0);
+	UT_ASSERT_EQ((int)stats.shmem_tt_slots_gcd, 0);
+	UT_ASSERT(cluster_tt_slot_current_owner_by_xid(
+		0, (TransactionId)100, &owner));
+	UT_ASSERT_EQ(owner.status, CTS_COMMITTED);
+	UT_ASSERT_EQ(owner.commit_scn, (SCN)10);
 }
 
 UT_TEST(test_t50_peer_mode_guc_off_cannot_bypass_cluster_floor)
@@ -1311,6 +1426,7 @@ main(void)
 	UT_RUN(test_t51_current_owner_snapshot_is_exact_and_rollover_bounded);
 	UT_RUN(test_t52_current_exact_alloc_reports_rollover_drift_without_mutation);
 	UT_RUN(test_t53_current_exact_alloc_captures_recycle_wrap_atomically);
+	UT_RUN(test_t54_peer_gc_rejects_exact_candidate_aba_after_release_sample);
 
 	return ut_failed_count == 0 ? 0 : 1;
 }
