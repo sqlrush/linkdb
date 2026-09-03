@@ -78,6 +78,7 @@ User-facing manual:
 | Configuration (`cluster.*` GUCs + `pgrac.conf`) | [docs/user-guide/configuration.md](docs/user-guide/configuration.md) |
 | System views reference | [docs/reference/system-views.md](docs/reference/system-views.md) |
 | Wait events reference | [docs/reference/wait-events.md](docs/reference/wait-events.md) |
+| Cross-node transaction safety | [docs/reference/cluster-transaction-safety.md](docs/reference/cluster-transaction-safety.md) |
 | Architecture overview | [docs/architecture/overview.md](docs/architecture/overview.md) |
 
 PostgreSQL upstream documentation lives under `doc/` and is shipped unchanged
